@@ -1,0 +1,32 @@
+name: scale_vpn
+description: "Steampunk V2Ray/Xray & Sing-box VPN client for Android and Windows"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  # Сеть: загрузка ключей с GitHub и проверка пинга
+  http: ^1.2.1
+  # Локальная память: сохранение рабочих ключей и настроек
+  shared_preferences: ^2.2.3
+  # Управление состоянием: передача данных между экранами
+  provider: ^6.1.2
+  # Стимпанк-графика: латунные шестерни, манометры, заклёпки
+  flutter_svg: ^2.0.10+1
+  # Шрифты: винтажная типографика под гравировку
+  google_fonts: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
