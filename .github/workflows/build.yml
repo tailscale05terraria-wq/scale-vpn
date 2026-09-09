@@ -25,11 +25,12 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Безопасная генерация платформы Android
+      - name: Безопасная генерация платформы Android и выдача разрешений
         run: |
           cp pubspec.yaml pubspec.backup.yaml
           flutter create --project-name scale_vpn --platforms=android --org com.scalevpn .
           cp pubspec.backup.yaml pubspec.yaml
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>' android/app/src/main/AndroidManifest.xml
           flutter pub get
 
       - name: Компиляция APK
