@@ -31,12 +31,11 @@ jobs:
           flutter create --project-name scale_vpn --platforms=android --org com.scalevpn .
           cp pubspec.backup.yaml pubspec.yaml
           
-          # Поднимаем минимальную версию Android до 24 для работы ядра Xray
-          sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 24/g' android/app/build.gradle || true
-          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/g' android/app/build.gradle || true
+          # ЖЕЛЕЗОБЕТОННОЕ повышение версии Android до 24 (требование Xray)
+          sed -i 's/flutter.minSdkVersion/24/g' android/app/build.gradle
           
-          # Добавляем системные права на управление сетевым туннелем VpnService
-          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>' android/app/src/main/AndroidManifest.xml
+          # Добавляем права на уведомления (Android 13+) и системный VPN
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>' android/app/src/main/AndroidManifest.xml
           
           flutter pub get
 
@@ -52,7 +51,7 @@ jobs:
   build-windows:
     name: Сборка Windows Desktop
     runs-on: windows-latest
-    continue-on-error: true # Изолируем Windows, чтобы мобильный плагин VPN не ломал конвейер
+    continue-on-error: true # Сборка упадет из-за flutter_v2ray, но не прервет выдачу APK
     steps:
       - name: Скачивание репозитория
         uses: actions/checkout@v4
