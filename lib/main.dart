@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_v2ray/flutter_v2ray.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -52,19 +53,40 @@ class MainVpnScreen extends StatefulWidget {
 
 class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProviderStateMixin {
   late AnimationController _gearController;
+  late final FlutterV2ray flutterV2ray = FlutterV2ray(
+    onStatusChanged: (status) {
+      if (mounted) {
+        setState(() {
+          final stateStr = status.state.toUpperCase();
+          if (stateStr.contains("CONNECTED")) {
+            isConnected = true;
+            isConnecting = false;
+            _gearController.stop();
+          } else if (stateStr.contains("CONNECTING")) {
+            isConnecting = true;
+            isConnected = false;
+            _gearController.repeat();
+          } else {
+            isConnected = false;
+            isConnecting = false;
+            _gearController.stop();
+          }
+        });
+      }
+    },
+  );
+
   bool isConnected = false;
   bool isConnecting = false;
   bool bypassRu = true;
   bool isLoadingKeys = false;
   
-  // 0 - Автоматические, 1 - Пользовательские
-  int currentTab = 0; 
+  int currentTab = 0; // 0 - Авто, 1 - Мои ключи
   int selectedIndex = 0;
 
   List<ServerNode> autoServers = [];
   List<ServerNode> customServers = [];
 
-  // Базовые проверенные узлы на случай отсутствия сети при первом старте
   final List<ServerNode> fallbackServers = [
     ServerNode(
       name: "Польша (Варшава / TLS)",
@@ -90,8 +112,15 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       vsync: this,
       duration: const Duration(seconds: 4),
     );
+    _initV2RayEngine();
     _loadCustomKeysFromStorage();
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadConfigsFromCdn());
+  }
+
+  void _initV2RayEngine() async {
+    try {
+      await flutterV2ray.initializeV2Ray();
+    } catch (_) {}
   }
 
   @override
@@ -100,7 +129,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     super.dispose();
   }
 
-  // Загрузка пользовательских ключей из памяти устройства
   Future<void> _loadCustomKeysFromStorage() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -121,7 +149,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } catch (_) {}
   }
 
-  // Сохранение пользовательских ключей
   Future<void> _saveCustomKeysToStorage() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -130,11 +157,9 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } catch (_) {}
   }
 
-  // Загрузка ключей через CDN-зеркало (доступно без VPN в РФ)
   Future<void> _loadConfigsFromCdn() async {
     setState(() => isLoadingKeys = true);
 
-    // Список надежных источников (CDN не блокируется провайдерами)
     final urls = [
       'https://cdn.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/clean/vless.txt',
       'https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/clean/vless.txt',
@@ -186,7 +211,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         _showToast("Загружено ${loaded.length} конфигураций из реестра", isSuccess: true);
       }
     } else {
-      // Если интернет заблокирован полностью, активируем резервные узлы
       if (mounted && autoServers.isEmpty) {
         setState(() {
           autoServers = List.from(fallbackServers);
@@ -214,7 +238,69 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     );
   }
 
-  // Диалог добавления своего ключа
+  // НАСТОЯЩЕЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ СИСТЕМНЫЙ VPNSERVICE ANDROID
+  void _handleToggle() async {
+    final activeList = currentTab == 0 ? autoServers : customServers;
+    if (activeList.isEmpty) {
+      _showToast("Список узлов пуст", isSuccess: false);
+      return;
+    }
+
+    final activeNode = activeList[selectedIndex];
+
+    if (isConnected) {
+      try {
+        await flutterV2ray.stopV2Ray();
+      } catch (_) {}
+      setState(() {
+        isConnected = false;
+        isConnecting = false;
+      });
+      _gearController.stop();
+      _showToast("Соединение разорвано", isSuccess: false);
+    } else {
+      setState(() => isConnecting = true);
+      _gearController.repeat();
+
+      try {
+        // Запрос системного разрешения Android на создание VPN
+        final bool permissionGranted = await flutterV2ray.requestPermission();
+
+        if (permissionGranted) {
+          final v2rayURL = FlutterV2ray.parseFromURL(activeNode.rawConfig);
+
+          // Список подсетей РФ для обхода (если включен тумблер)
+          final ruBypassSubnets = [
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            "5.8.0.0/13", "5.16.0.0/12", "31.13.0.0/16", "31.173.0.0/16",
+            "77.82.0.0/15", "79.132.0.0/14", "80.64.0.0/11", "81.1.0.0/16",
+            "82.145.0.0/16", "83.149.0.0/16", "87.240.128.0/18", "91.198.0.0/16",
+            "92.242.0.0/15", "93.186.224.0/19", "95.163.0.0/16", "178.248.232.0/21",
+            "185.32.187.0/24", "185.38.168.0/22", "185.70.184.0/22", "185.165.120.0/22"
+          ];
+
+          await flutterV2ray.startV2Ray(
+            remark: activeNode.name,
+            config: v2rayURL.getFullConfiguration(),
+            proxyOnly: false,
+            bypassSubnets: bypassRu ? ruBypassSubnets : null,
+            notificationDisconnectButtonName: "ОТКЛЮЧИТЬ",
+          );
+
+          _showToast("Системный VPN-туннель активирован", isSuccess: true);
+        } else {
+          setState(() => isConnecting = false);
+          _gearController.stop();
+          _showToast("Разрешение на VPN отклонено в системе", isSuccess: false);
+        }
+      } catch (e) {
+        setState(() => isConnecting = false);
+        _gearController.stop();
+        _showToast("Ошибка конфигурации протокола", isSuccess: false);
+      }
+    }
+  }
+
   void _showAddKeyDialog() {
     final nameController = TextEditingController();
     final configController = TextEditingController();
@@ -242,7 +328,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                 controller: nameController,
                 style: const TextStyle(color: Colors.white, fontSize: 13),
                 decoration: InputDecoration(
-                  hintText: "Название (например: Мой сервер)",
+                  hintText: "Название узла",
                   hintStyle: const TextStyle(color: Color(0xFF756D65), fontSize: 12),
                   filled: true,
                   fillColor: const Color(0xFF13110F),
@@ -298,44 +384,13 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
               _saveCustomKeysToStorage();
               Navigator.pop(context);
-              _showToast("Конфигурация успешно сохранена", isSuccess: true);
+              _showToast("Конфигурация сохранена", isSuccess: true);
             },
             child: const Text("ДОБАВИТЬ", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
           ),
         ],
       ),
     );
-  }
-
-  void _handleToggle() async {
-    final activeList = currentTab == 0 ? autoServers : customServers;
-    if (activeList.isEmpty) {
-      _showToast("Список узлов пуст", isSuccess: false);
-      return;
-    }
-
-    if (isConnected) {
-      setState(() {
-        isConnected = false;
-        isConnecting = false;
-      });
-      _gearController.stop();
-      _showToast("Соединение разорвано", isSuccess: false);
-    } else {
-      setState(() => isConnecting = true);
-      _gearController.repeat();
-
-      await Future.delayed(const Duration(seconds: 2));
-
-      if (mounted) {
-        setState(() {
-          isConnecting = false;
-          isConnected = true;
-        });
-        _gearController.stop();
-        _showToast("Защищенный туннель активирован", isSuccess: true);
-      }
-    }
   }
 
   void _showInfoDialog() {
@@ -370,8 +425,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                 "Каждые несколько часов проверяется время отклика каждого узла. Недоступные серверы исключаются из выдачи.\n\n"
                 "3. Отказоустойчивая доставка:\n"
                 "Синхронизация происходит через независимые CDN-каналы, что гарантирует получение актуальных ключей даже при фильтрации GitHub.\n\n"
-                "4. Пользовательский реестр:\n"
-                "Вы можете подключать собственные приватные серверы во вкладке пользовательских ключей.",
+                "4. Системный туннель VpnService:\n"
+                "При активации создается системный сетевой адаптер Android, через который маршрутизируется трафик.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
             ],
@@ -396,7 +451,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       body: SafeArea(
         child: Column(
           children: [
-            // ВЕРХНЯЯ ПАНЕЛЬ
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
               child: Row(
@@ -460,7 +514,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const Spacer(),
 
-            // ЦЕНТРАЛЬНАЯ КНОПКА (Шестереночный механизм)
             GestureDetector(
               onTap: _handleToggle,
               child: Stack(
@@ -519,7 +572,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 20),
 
-            // Текстовый статус
             Text(
               isConnected
                   ? "СОЕДИНЕНИЕ АКТИВНО"
@@ -534,7 +586,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 8),
 
-            // Индикатор пинга
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
               decoration: BoxDecoration(
@@ -559,7 +610,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const Spacer(),
 
-            // Тумблер обхода сайтов РФ
             Container(
               margin: const EdgeInsets.symmetric(horizontal: 20),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -595,7 +645,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 12),
 
-            // НИЖНЯЯ ПАНЕЛЬ С ДВУМЯ ВКЛАДКАМИ
             Container(
               height: 240,
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
@@ -606,7 +655,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               ),
               child: Column(
                 children: [
-                  // Переключатель вкладок (Авто / Свои)
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -627,7 +675,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                   ),
                   const SizedBox(height: 8),
 
-                  // Список узлов выбранной вкладки
                   Expanded(
                     child: activeList.isEmpty
                         ? Center(
