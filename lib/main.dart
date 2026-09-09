@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -31,17 +32,25 @@ class ScaleVpnApp extends StatelessWidget {
   }
 }
 
+class ServerEndpoint {
+  final String host;
+  final int port;
+  ServerEndpoint(this.host, this.port);
+}
+
 class ServerNode {
   final String name;
   final String rawConfig;
-  int ping; // -2: замер, -1: мертв, >0: мс
+  int ping; // -2: замер, -1: таймаут, >0: миллисекунды
   final bool isCustom;
+  bool isPinned;
 
   ServerNode({
     required this.name,
     required this.rawConfig,
     required this.ping,
     this.isCustom = false,
+    this.isPinned = false,
   });
 }
 
@@ -96,6 +105,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
   List<ServerNode> autoServers = [];
   List<ServerNode> customServers = [];
+  Set<String> pinnedConfigs = {};
 
   final List<String> gitHubSources = [
     'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/vless.txt',
@@ -112,7 +122,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       duration: const Duration(seconds: 4),
     );
     _initV2RayEngine();
-    _loadCustomKeysFromStorage();
+    _loadStoredData();
     WidgetsBinding.instance.addPostFrameCallback((_) => _searchGitHubForKeys());
   }
 
@@ -128,21 +138,30 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     super.dispose();
   }
 
-  Future<void> _loadCustomKeysFromStorage() async {
+  Future<void> _loadStoredData() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      
+      // Загрузка закрепленных ключей
+      final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
+      pinnedConfigs = pinnedList.toSet();
+
+      // Загрузка пользовательских ключей
       final saved = prefs.getStringList('custom_vpn_keys') ?? [];
       if (saved.isNotEmpty) {
         setState(() {
           customServers = saved.map((str) {
             final parts = str.split('::');
+            final config = parts.length > 1 ? parts[1] : str;
             return ServerNode(
               name: parts.isNotEmpty ? parts[0] : "Свой узел",
-              rawConfig: parts.length > 1 ? parts[1] : str,
+              rawConfig: config,
               ping: -2,
               isCustom: true,
+              isPinned: pinnedConfigs.contains(config),
             );
           }).toList();
+          _sortNodes(customServers);
         });
       }
     } catch (_) {}
@@ -154,6 +173,124 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       final list = customServers.map((s) => "${s.name}::${s.rawConfig}").toList();
       await prefs.setStringList('custom_vpn_keys', list);
     } catch (_) {}
+  }
+
+  Future<void> _savePinnedKeysToStorage() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList('pinned_vpn_configs', pinnedConfigs.toList());
+    } catch (_) {}
+  }
+
+  // Парсинг сетевого адреса и порта для прямого TCP-замера
+  ServerEndpoint? _parseEndpoint(String rawConfig) {
+    try {
+      final uri = Uri.tryParse(rawConfig);
+      if (uri != null && uri.host.isNotEmpty && uri.port > 0) {
+        return ServerEndpoint(uri.host, uri.port);
+      }
+    } catch (_) {}
+
+    try {
+      final ipv6Reg = RegExp(r'@\[([a-fA-F0-9:]+)\]:(\d+)');
+      final match = ipv6Reg.firstMatch(rawConfig);
+      if (match != null) {
+        return ServerEndpoint(match.group(1)!, int.parse(match.group(2)!));
+      }
+    } catch (_) {}
+
+    try {
+      final reg = RegExp(r'@([a-zA-Z0-9\.\-]+):(\d+)');
+      final match = reg.firstMatch(rawConfig);
+      if (match != null) {
+        return ServerEndpoint(match.group(1)!, int.parse(match.group(2)!));
+      }
+    } catch (_) {}
+
+    if (rawConfig.startsWith('ss://')) {
+      try {
+        final body = rawConfig.substring(5).split('#').first;
+        if (body.contains('@')) {
+          final hostPort = body.split('@').last.split(':');
+          return ServerEndpoint(hostPort[0], int.tryParse(hostPort[1]) ?? 443);
+        } else {
+          String b64 = body;
+          while (b64.length % 4 != 0) {
+            b64 += '=';
+          }
+          final decoded = utf8.decode(base64.decode(b64));
+          if (decoded.contains('@')) {
+            final hostPort = decoded.split('@').last.split(':');
+            return ServerEndpoint(hostPort[0], int.tryParse(hostPort[1]) ?? 443);
+          }
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }
+
+  // Экспресс-замер задержки TCP Handshake (TCPing)
+  Future<int> _measureTcpPing(String rawConfig) async {
+    final endpoint = _parseEndpoint(rawConfig);
+    if (endpoint == null) return -1;
+
+    final stopwatch = Stopwatch()..start();
+    try {
+      final socket = await Socket.connect(
+        endpoint.host,
+        endpoint.port,
+        timeout: const Duration(milliseconds: 1500),
+      );
+      stopwatch.stop();
+      socket.destroy();
+      return stopwatch.elapsedMilliseconds;
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  // Сортировка: закрепленные сверху, далее по возрастанию пинга (лучшие первыми)
+  void _sortNodes(List<ServerNode> list) {
+    final currentSelected = (list.isNotEmpty && selectedIndex < list.length)
+        ? list[selectedIndex]
+        : null;
+
+    list.sort((a, b) {
+      if (a.isPinned && !b.isPinned) return -1;
+      if (!a.isPinned && b.isPinned) return 1;
+
+      int score(ServerNode n) {
+        if (n.ping > 0) return n.ping;
+        if (n.ping == -2) return 99999;
+        return 999999;
+      }
+
+      return score(a).compareTo(score(b));
+    });
+
+    if (currentSelected != null) {
+      final newIdx = list.indexOf(currentSelected);
+      if (newIdx != -1) {
+        selectedIndex = newIdx;
+      }
+    }
+  }
+
+  void _togglePin(ServerNode item) {
+    setState(() {
+      item.isPinned = !item.isPinned;
+      if (item.isPinned) {
+        pinnedConfigs.add(item.rawConfig);
+        _showToast("Узел закреплен вверху списка", isSuccess: true);
+      } else {
+        pinnedConfigs.remove(item.rawConfig);
+        _showToast("Узел откреплен", isSuccess: false);
+      }
+      final list = currentTab == 0 ? autoServers : customServers;
+      _sortNodes(list);
+    });
+    _savePinnedKeysToStorage();
   }
 
   List<String> _extractConfigs(String rawData) {
@@ -181,7 +318,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return results;
   }
 
-  // Поиск ключей на GitHub
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
     setState(() => isSearchingGitHub = true);
@@ -190,6 +326,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
     List<ServerNode> collectedNodes = [];
 
+    // Сохраняем ранее закрепленные узлы
+    final existingPinned = autoServers.where((s) => s.isPinned).toList();
+    collectedNodes.addAll(existingPinned);
+
     for (final url in gitHubSources) {
       try {
         final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
@@ -197,6 +337,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           final configs = _extractConfigs(res.body);
 
           for (final config in configs) {
+            if (collectedNodes.any((n) => n.rawConfig == config)) continue;
+
             String title = "Узел ${collectedNodes.length + 1}";
             if (config.contains('#')) {
               try {
@@ -205,150 +347,116 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                 title = config.split('#').last;
               }
             }
+
+            final isPinned = pinnedConfigs.contains(config);
             collectedNodes.add(ServerNode(
               name: title.isEmpty ? "Узел ${collectedNodes.length + 1}" : title,
               rawConfig: config,
               ping: -2,
+              isPinned: isPinned,
             ));
-            if (collectedNodes.length >= 15) break;
+            if (collectedNodes.length >= 18) break;
           }
         }
       } catch (_) {
         continue;
       }
-      if (collectedNodes.length >= 15) break;
+      if (collectedNodes.length >= 18) break;
     }
 
     if (collectedNodes.isNotEmpty && mounted) {
       setState(() {
         autoServers = collectedNodes;
+        _sortNodes(autoServers);
         selectedIndex = 0;
       });
 
-      _showToast("Получено ${collectedNodes.length} узлов. Тестирование задержки...", isSuccess: true);
+      _showToast("Получено ${collectedNodes.length} узлов. Экспресс-замер...", isSuccess: true);
 
-      // Пакетный замер для предотвращения перегрузки канала
-      await _testNodesInBatches(autoServers);
+      // Параллельный замер TCPing с живым ранжированием на лету
+      await Future.wait(autoServers.map((node) async {
+        final delay = await _measureTcpPing(node.rawConfig);
+        if (mounted) {
+          setState(() {
+            node.ping = delay;
+            _sortNodes(autoServers);
+          });
+        }
+      }));
 
-      // Удаление нерабочих узлов после полного первичного опроса
+      // Удаление нерабочих незакрепленных узлов
       if (mounted) {
         setState(() {
-          autoServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
+          autoServers.removeWhere((s) => !s.isPinned && s.ping <= 0);
+          _sortNodes(autoServers);
           if (selectedIndex >= autoServers.length) selectedIndex = 0;
         });
-        _showToast("Очистка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
+        _showToast("Готово. Активных узлов: ${autoServers.length}", isSuccess: true);
       }
     } else {
       if (mounted) {
-        _showToast("Ошибка связи с зеркалами GitHub", isSuccess: false);
+        _showToast("Ошибка связи с реестрами GitHub", isSuccess: false);
       }
     }
 
     if (mounted) setState(() => isSearchingGitHub = false);
   }
 
-  // Пакетный замер (по 3 узла одновременно)
-  Future<void> _testNodesInBatches(List<ServerNode> nodes) async {
-    const batchSize = 3;
-    for (int i = 0; i < nodes.length; i += batchSize) {
-      if (!mounted) break;
-      final end = (i + batchSize < nodes.length) ? i + batchSize : nodes.length;
-      final batch = nodes.sublist(i, end);
-      await Future.wait(batch.map((node) => _testNodePing(node)));
+  // Точечный замер одного узла
+  Future<void> _testNodePing(ServerNode node) async {
+    if (!mounted) return;
+    setState(() => node.ping = -2);
+
+    int delay = -1;
+    final activeList = currentTab == 0 ? autoServers : customServers;
+    final isCurrentlyConnectedNode = isConnected &&
+        activeList.isNotEmpty &&
+        selectedIndex < activeList.length &&
+        activeList[selectedIndex] == node;
+
+    if (isCurrentlyConnectedNode) {
+      try {
+        delay = await flutterV2ray
+            .getConnectedServerDelay(url: 'https://cp.cloudflare.com/generate_204')
+            .timeout(const Duration(milliseconds: 1500), onTimeout: () => -1);
+      } catch (_) {
+        delay = -1;
+      }
+    }
+
+    if (delay <= 0) {
+      delay = await _measureTcpPing(node.rawConfig);
+    }
+
+    if (mounted) {
+      setState(() {
+        node.ping = delay;
+        _sortNodes(activeList);
+      });
     }
   }
 
-  // Очистка нерабочих узлов без повторного тестирования живых
-  Future<void> _purgeDeadNodes() async {
+  // Очистка нерабочих узлов (закрепленные защищены от удаления)
+  void _purgeDeadNodes() {
     final list = currentTab == 0 ? autoServers : customServers;
     if (list.isEmpty) return;
 
-    // 1. Если есть еще не проверенные узлы, замеряем только их
-    final unmeasured = list.where((s) => s.ping == -2).toList();
-    if (unmeasured.isNotEmpty) {
-      _showToast("Тестирование оставшихся узлов...", isSuccess: true);
-      await _testNodesInBatches(unmeasured);
-    }
-
-    if (!mounted) return;
-
-    // 2. Мгновенное удаление узлов с таймаутом
-    int removedCount = 0;
+    final before = list.length;
     setState(() {
-      if (currentTab == 0) {
-        final before = autoServers.length;
-        autoServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
-        removedCount = before - autoServers.length;
-        if (selectedIndex >= autoServers.length) selectedIndex = 0;
-      } else {
-        final before = customServers.length;
-        customServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
-        removedCount = before - customServers.length;
-        if (selectedIndex >= customServers.length) selectedIndex = 0;
-        _saveCustomKeysToStorage();
-      }
+      list.removeWhere((s) => !s.isPinned && s.ping <= 0 && s.ping != -2);
+      _sortNodes(list);
+      if (selectedIndex >= list.length) selectedIndex = 0;
     });
+
+    final removedCount = before - list.length;
+    if (currentTab == 1) {
+      _saveCustomKeysToStorage();
+    }
 
     if (removedCount > 0) {
       _showToast("Удалено нерабочих узлов: $removedCount", isSuccess: true);
     } else {
       _showToast("Все узлы в списке активны", isSuccess: true);
-    }
-  }
-
-  // Точечный замер задержки с жестким таймаутом 3 сек
-  Future<void> _testNodePing(ServerNode node, {bool force = false}) async {
-    if (!mounted) return;
-    if (!force && node.ping == -2) return;
-
-    setState(() => node.ping = -2);
-
-    try {
-      int delay = -1;
-
-      final activeList = currentTab == 0 ? autoServers : customServers;
-      final isCurrentlyConnectedNode = isConnected &&
-          activeList.isNotEmpty &&
-          selectedIndex < activeList.length &&
-          activeList[selectedIndex] == node;
-
-      if (isCurrentlyConnectedNode) {
-        // Замер активного соединения через рабочий туннель
-        delay = await flutterV2ray
-            .getConnectedServerDelay(url: 'https://cp.cloudflare.com/generate_204')
-            .timeout(const Duration(seconds: 3), onTimeout: () => -1);
-      } else {
-        // Автономный замер конфигурации
-        final v2rayURL = FlutterV2ray.parseFromURL(node.rawConfig);
-
-        v2rayURL.dns = {
-          "servers": [
-            "https://dns.google/dns-query",
-            "8.8.8.8",
-            "1.1.1.1",
-            "111.88.96.50",
-            "77.88.8.8"
-          ],
-          "queryStrategy": "UseIP"
-        };
-
-        delay = await flutterV2ray
-            .getServerDelay(
-              config: v2rayURL.getFullConfiguration(),
-              url: 'https://cp.cloudflare.com/generate_204',
-            )
-            .timeout(const Duration(seconds: 3), onTimeout: () => -1);
-      }
-
-      if (mounted) {
-        setState(() {
-          node.ping = delay;
-        });
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() => node.ping = -1);
-      }
     }
   }
 
@@ -529,16 +637,23 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               }
               if (title.isEmpty) title = "Свой узел ${customServers.length + 1}";
 
-              final newNode = ServerNode(name: title, rawConfig: raw, ping: -2, isCustom: true);
+              final newNode = ServerNode(
+                name: title,
+                rawConfig: raw,
+                ping: -2,
+                isCustom: true,
+                isPinned: pinnedConfigs.contains(raw),
+              );
 
               setState(() {
                 customServers.insert(0, newNode);
                 currentTab = 1;
                 selectedIndex = 0;
+                _sortNodes(customServers);
               });
 
               _saveCustomKeysToStorage();
-              _testNodePing(newNode, force: true);
+              _testNodePing(newNode);
               Navigator.pop(context);
               _showToast("Ключ сохранен", isSuccess: true);
             },
@@ -576,11 +691,13 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               SizedBox(height: 8),
               Text(
                 "1. Сбор реестров GitHub:\n"
-                "Опрос открытых источников VLESS Reality каждые 15 минут.\n\n"
-                "2. Пакетная валидация задержки:\n"
-                "Опрос узлов группами через Anycast Cloudflare с таймаутом 3 секунды. Узлы без отклика отсекаются.\n\n"
-                "3. DNS-туннелирование:\n"
-                "DNS-трафик на порт 53 инкапсулируется в зашифрованный туннель с DoH каскадом.",
+                "Опрос открытых источников VLESS Reality и Shadowsocks каждые 15 минут.\n\n"
+                "2. Экспресс-замер TCP Handshake:\n"
+                "Мгновенный замер задержки через прямой TCP SYN/ACK сокет. Автоматическая сортировка лучших узлов наверх списка.\n\n"
+                "3. Закрепление узлов:\n"
+                "Возможность зафиксировать надежные ключи вверху реестра с защитой от очистки.\n\n"
+                "4. DNS-туннелирование:\n"
+                "DNS-трафик маршрутизируется внутрь туннеля через DoH каскад для обхода фильтрации.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
             ],
@@ -813,7 +930,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                         children: [
                           IconButton(
                             icon: const Icon(Icons.cleaning_services, color: Color(0xFFC5A059), size: 18),
-                            tooltip: "Очистить мертвые узлы",
+                            tooltip: "Очистить нерабочие узлы",
                             onPressed: _purgeDeadNodes,
                           ),
                           if (currentTab == 1)
@@ -846,7 +963,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                               final isCurrent = idx == selectedIndex;
                               return GestureDetector(
                                 onTap: () {
-                                  // Переключение выбора без сброса готового пинга
                                   setState(() => selectedIndex = idx);
                                   if (item.ping == -2) {
                                     _testNodePing(item);
@@ -873,19 +989,26 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                             height: 8,
                                             decoration: BoxDecoration(
                                               shape: BoxShape.circle,
-                                              color: isCurrent ? const Color(0xFFFF9800) : const Color(0xFF5A524A),
+                                              color: item.isPinned
+                                                  ? const Color(0xFFFF9800)
+                                                  : (isCurrent ? const Color(0xFFC5A059) : const Color(0xFF5A524A)),
                                             ),
                                           ),
                                           const SizedBox(width: 10),
+                                          if (item.isPinned)
+                                            const Padding(
+                                              padding: EdgeInsets.only(right: 6),
+                                              child: Icon(Icons.push_pin, size: 13, color: Color(0xFFFF9800)),
+                                            ),
                                           SizedBox(
-                                            width: MediaQuery.of(context).size.width * 0.45,
+                                            width: MediaQuery.of(context).size.width * (item.isPinned ? 0.38 : 0.42),
                                             child: Text(
                                               item.name,
                                               overflow: TextOverflow.ellipsis,
                                               style: TextStyle(
                                                 color: isCurrent ? Colors.white : const Color(0xFFD6D3D1),
                                                 fontSize: 12,
-                                                fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                                                fontWeight: (isCurrent || item.isPinned) ? FontWeight.bold : FontWeight.normal,
                                               ),
                                             ),
                                           ),
@@ -894,11 +1017,20 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                       Row(
                                         children: [
                                           _buildPingBadge(item.ping),
-                                          const SizedBox(width: 6),
+                                          const SizedBox(width: 4),
+                                          IconButton(
+                                            icon: Icon(
+                                              item.isPinned ? Icons.push_pin : Icons.push_pin_outlined,
+                                              size: 16,
+                                              color: item.isPinned ? const Color(0xFFFF9800) : const Color(0xFF8C827A),
+                                            ),
+                                            tooltip: item.isPinned ? "Открепить узел" : "Закрепить узел вверху",
+                                            onPressed: () => _togglePin(item),
+                                          ),
                                           IconButton(
                                             icon: const Icon(Icons.network_check, size: 16, color: Color(0xFFC5A059)),
                                             tooltip: "Замерить задержку",
-                                            onPressed: () => _testNodePing(item, force: true),
+                                            onPressed: () => _testNodePing(item),
                                           ),
                                           IconButton(
                                             icon: const Icon(Icons.copy, size: 15, color: Color(0xFF8C827A)),
