@@ -1,0 +1,72 @@
+name: Build Scale VPN (APK & Windows)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Сборка Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачивание репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Установка Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Безопасная генерация платформы Android
+        run: |
+          cp pubspec.yaml pubspec.backup.yaml
+          flutter create --project-name scale_vpn --platforms=android --org com.scalevpn .
+          cp pubspec.backup.yaml pubspec.yaml
+          flutter pub get
+
+      - name: Компиляция APK
+        run: flutter build apk --release
+
+      - name: Выгрузка готового APK файла
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScaleVPN-Android
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+  build-windows:
+    name: Сборка Windows Desktop
+    runs-on: windows-latest
+    steps:
+      - name: Скачивание репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Безопасная генерация платформы Windows
+        shell: bash
+        run: |
+          cp pubspec.yaml pubspec.backup.yaml
+          flutter create --project-name scale_vpn --platforms=windows --org com.scalevpn .
+          cp pubspec.backup.yaml pubspec.yaml
+          flutter pub get
+
+      - name: Компиляция для Windows
+        run: flutter build windows --release
+
+      - name: Выгрузка программы для Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScaleVPN-Windows
+          path: build/windows/x64/runner/Release/
