@@ -15,10 +15,10 @@ class ScaleVpnApp extends StatelessWidget {
       title: 'Scale VPN',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF0F0E0D), // Глубокий графит
+        scaffoldBackgroundColor: const Color(0xFF0F0E0D),
         colorScheme: const ColorScheme.dark(
-          primary: Color(0xFFC5A059), // Шлифованная латунь
-          secondary: Color(0xFFFF9800), // Теплый янтарный индикатор
+          primary: Color(0xFFC5A059),
+          secondary: Color(0xFFFF9800),
           surface: Color(0xFF1A1816),
         ),
       ),
@@ -63,7 +63,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       vsync: this,
       duration: const Duration(seconds: 4),
     );
-    // Автоматическая загрузка ключей при старте
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadConfigsFromGithub());
   }
 
@@ -73,13 +72,12 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     super.dispose();
   }
 
-  // Загрузка ключей из открытых баз GitHub
   Future<void> _loadConfigsFromGithub() async {
     setState(() => isLoadingKeys = true);
 
     try {
       final response = await http.get(Uri.parse(
-        'https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/clean/vless.txt'
+        'https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/clean/vless.txt',
       )).timeout(const Duration(seconds: 8));
 
       if (response.statusCode == 200 && response.body.isNotEmpty) {
@@ -111,14 +109,14 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             servers = loaded;
             selectedIndex = 0;
           });
-          _showToast("Список конфигураций успешно синхронизирован (${loaded.length} узлов)", isSuccess: true);
+          _showToast("Синхронизировано ${loaded.length} конфигураций", isSuccess: true);
         }
       } else {
-        throw Exception("Ошибка ответа сервера: ${response.statusCode}");
+        throw Exception("Ошибка: ${response.statusCode}");
       }
     } catch (e) {
       if (mounted) {
-        _showToast("Ошибка синхронизации: требуется доступ в сеть", isSuccess: false);
+        _showToast("Ошибка сети при обращении к GitHub", isSuccess: false);
       }
     } finally {
       if (mounted) setState(() => isLoadingKeys = false);
@@ -170,7 +168,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     }
   }
 
-  // Окно с подробным описанием работы робота
   void _showInfoDialog() {
     showDialog(
       context: context,
@@ -178,7 +175,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         backgroundColor: const Color(0xFF1B1917),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(16),
-          side: const Border painfulSide = BorderSide(color: Color(0xFFC5A059), width: 1.2),
+          side: const BorderSide(color: Color(0xFFC5A059), width: 1.2),
         ),
         title: Row(
           children: const [
@@ -192,19 +189,19 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             crossAxisAlignment: CrossAxisAlignment.start,
             children: const [
               Text(
-                "Как работает Scale VPN:",
+                "Как устроен Scale VPN:",
                 style: TextStyle(color: Color(0xFFC5A059), fontWeight: FontWeight.bold, fontSize: 13),
               ),
               SizedBox(height: 8),
               Text(
                 "1. Автономный облачный сборщик:\n"
-                "Серверные сценарии на GitHub непрерывно отслеживают открытые репозитории с ключами протоколов VLESS Reality и Shadowsocks.\n\n"
+                "Скрипты на GitHub непрерывно сканируют открытые пулы ключей VLESS Reality и Shadowsocks.\n\n"
                 "2. Валидация и удаление нерабочих узлов:\n"
-                "Система в фоновом режиме выполняет пинг-тест и проверку рукопожатия (handshake). Неотвечающие и заблокированные серверы отсеиваются автоматически.\n\n"
+                "Система автоматически отсеивает не отвечающие и заблокированные серверы через пинг-тест.\n\n"
                 "3. Прямая доставка в клиент:\n"
-                "При нажатии кнопки обновления приложение связывается с проверенным реестром и загружает только работоспособные конфигурации с минимальной задержкой.\n\n"
+                "При синхронизации приложение получает только актуальные ключи с наименьшей задержкой.\n\n"
                 "4. Маршрутизация (Bypass RU):\n"
-                "При включенном тумблере запросы к российским доменам (.ru, банки, порталы госуслуг) направляются в обход прокси на максимальной скорости.",
+                "При включенном тумблере российские сайты и сервисы работают напрямую на максимальной скорости.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
             ],
@@ -226,7 +223,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       body: SafeArea(
         child: Column(
           children: [
-            // ВЕРХНИЙ БАР: Логотип, кнопка Инфо и кнопка синхронизации
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
               child: Row(
@@ -290,13 +286,11 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const Spacer(),
 
-            // ЦЕНТРАЛЬНАЯ КНОПКА ПОДКЛЮЧЕНИЯ (Шестереночный регулятор)
             GestureDetector(
               onTap: _handleToggle,
               child: Stack(
                 alignment: Alignment.center,
                 children: [
-                  // Мягкое свечение
                   AnimatedContainer(
                     duration: const Duration(milliseconds: 500),
                     width: 210,
@@ -305,28 +299,20 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                       shape: BoxShape.circle,
                       boxShadow: [
                         BoxShadow(
-                          color: isConnected
-                              ? const Color(0xFFFF9800).withValues(alpha: 0.3)
-                              : Colors.transparent,
+                          color: isConnected ? const Color(0x4DFF9800) : Colors.transparent,
                           blurRadius: 40,
                           spreadRadius: 10,
                         ),
                       ],
                     ),
                   ),
-
-                  // Металлическая шестерня
                   RotationTransition(
                     turns: _gearController,
                     child: CustomPaint(
                       size: const Size(190, 190),
-                      painter: PolishedGearPainter(
-                        isActive: isConnected,
-                      ),
+                      painter: PolishedGearPainter(isActive: isConnected),
                     ),
                   ),
-
-                  // Центральная кнопка питания
                   Container(
                     width: 78,
                     height: 78,
@@ -339,7 +325,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                       ),
                       boxShadow: [
                         BoxShadow(
-                          color: isConnected ? const Color(0xFFFF9800).withValues(alpha: 0.5) : Colors.black87,
+                          color: isConnected ? const Color(0x80FF9800) : Colors.black87,
                           blurRadius: isConnected ? 16 : 4,
                         ),
                       ],
@@ -358,7 +344,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 20),
 
-            // Статус подключения (Четкий контрастный текст)
             Text(
               isConnected
                   ? "СОЕДИНЕНИЕ УСТАНОВЛЕНО"
@@ -373,7 +358,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 10),
 
-            // Задержка (Пинг)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
               decoration: BoxDecoration(
@@ -398,7 +382,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const Spacer(),
 
-            // Тумблер маршрутизации (Обход сайтов РФ)
             Container(
               margin: const EdgeInsets.symmetric(horizontal: 20),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -434,7 +417,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 12),
 
-            // Список серверов (Контрастные карточки с белым текстом)
             Container(
               height: 200,
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
@@ -533,7 +515,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   }
 }
 
-// Аккуратная шестерня из шлифованного металла
 class PolishedGearPainter extends CustomPainter {
   final bool isActive;
 
@@ -579,12 +560,10 @@ class PolishedGearPainter extends CustomPainter {
     canvas.drawPath(path, gearPaint);
     canvas.drawPath(path, edgePaint);
 
-    // Внутреннее углубление
     final rimR = innerR - 16;
     canvas.drawCircle(center, rimR, Paint()..color = const Color(0xFF141210));
     canvas.drawCircle(center, rimR, edgePaint);
 
-    // Заклёпки
     final rivetPaint = Paint()..color = isActive ? const Color(0xFF8C7038) : const Color(0xFF332F2B);
     for (int i = 0; i < teeth; i++) {
       final a = (i * 2 * math.pi) / teeth + (math.pi / teeth);
