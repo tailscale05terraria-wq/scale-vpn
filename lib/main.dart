@@ -55,13 +55,12 @@ class MainVpnScreen extends StatefulWidget {
 class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProviderStateMixin {
   late AnimationController _gearController;
   
-  // Флаг принудительной остановки пользователем
   bool _isManuallyStopped = false;
 
   late final FlutterV2ray flutterV2ray = FlutterV2ray(
     onStatusChanged: (status) {
       if (!mounted) return;
-      if (_isManuallyStopped) return; // Игнорируем запоздалые события после нажатия "Отключить"
+      if (_isManuallyStopped) return;
 
       final stateStr = status.state.toUpperCase().trim();
 
@@ -90,7 +89,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
   bool isConnected = false;
   bool isConnecting = false;
-  bool bypassRu = true;
   bool isSearchingGitHub = false;
   
   int currentTab = 0; // 0 - GitHub, 1 - Мои ключи
@@ -183,7 +181,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return results;
   }
 
-  // Поиск с одновременной параллельной фильтрацией
+  // Поиск ключей на GitHub
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
     setState(() => isSearchingGitHub = true);
@@ -227,10 +225,19 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         selectedIndex = 0;
       });
 
-      _showToast("Найдено ${collectedNodes.length} ключей. Замер и очистка...", isSuccess: true);
+      _showToast("Получено ${collectedNodes.length} узлов. Тестирование задержки...", isSuccess: true);
 
-      // Параллельный замер и мгновенное удаление нерабочих
-      await _validateAndPurgeDeadNodes();
+      // Пакетный замер для предотвращения перегрузки канала
+      await _testNodesInBatches(autoServers);
+
+      // Удаление нерабочих узлов после полного первичного опроса
+      if (mounted) {
+        setState(() {
+          autoServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
+          if (selectedIndex >= autoServers.length) selectedIndex = 0;
+        });
+        _showToast("Очистка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
+      }
     } else {
       if (mounted) {
         _showToast("Ошибка связи с зеркалами GitHub", isSuccess: false);
@@ -240,51 +247,99 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     if (mounted) setState(() => isSearchingGitHub = false);
   }
 
-  // ПАРАЛЛЕЛЬНАЯ ПРОВЕРКА И УДАЛЕНИЕ МЕРТВЫХ УЗЛОВ
-  Future<void> _validateAndPurgeDeadNodes() async {
-    final list = currentTab == 0 ? autoServers : customServers;
-    if (list.isEmpty) return;
-
-    // Запускаем замер всех узлов параллельно (быстро)
-    await Future.wait(list.map((node) => _testNodePing(node)));
-
-    // Мгновенно удаляем все с таймаутом (-1)
-    if (mounted) {
-      setState(() {
-        if (currentTab == 0) {
-          autoServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
-          if (selectedIndex >= autoServers.length) selectedIndex = 0;
-        } else {
-          customServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
-          if (selectedIndex >= customServers.length) selectedIndex = 0;
-          _saveCustomKeysToStorage();
-        }
-      });
-      _showToast("Нерабочие узлы удалены. Остались только проверенные!", isSuccess: true);
+  // Пакетный замер (по 3 узла одновременно)
+  Future<void> _testNodesInBatches(List<ServerNode> nodes) async {
+    const batchSize = 3;
+    for (int i = 0; i < nodes.length; i += batchSize) {
+      if (!mounted) break;
+      final end = (i + batchSize < nodes.length) ? i + batchSize : nodes.length;
+      final batch = nodes.sublist(i, end);
+      await Future.wait(batch.map((node) => _testNodePing(node)));
     }
   }
 
-  // Замер пинга через Xray
-  Future<void> _testNodePing(ServerNode node) async {
+  // Очистка нерабочих узлов без повторного тестирования живых
+  Future<void> _purgeDeadNodes() async {
+    final list = currentTab == 0 ? autoServers : customServers;
+    if (list.isEmpty) return;
+
+    // 1. Если есть еще не проверенные узлы, замеряем только их
+    final unmeasured = list.where((s) => s.ping == -2).toList();
+    if (unmeasured.isNotEmpty) {
+      _showToast("Тестирование оставшихся узлов...", isSuccess: true);
+      await _testNodesInBatches(unmeasured);
+    }
+
     if (!mounted) return;
+
+    // 2. Мгновенное удаление узлов с таймаутом
+    int removedCount = 0;
+    setState(() {
+      if (currentTab == 0) {
+        final before = autoServers.length;
+        autoServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
+        removedCount = before - autoServers.length;
+        if (selectedIndex >= autoServers.length) selectedIndex = 0;
+      } else {
+        final before = customServers.length;
+        customServers.removeWhere((s) => s.ping <= 0 && s.ping != -2);
+        removedCount = before - customServers.length;
+        if (selectedIndex >= customServers.length) selectedIndex = 0;
+        _saveCustomKeysToStorage();
+      }
+    });
+
+    if (removedCount > 0) {
+      _showToast("Удалено нерабочих узлов: $removedCount", isSuccess: true);
+    } else {
+      _showToast("Все узлы в списке активны", isSuccess: true);
+    }
+  }
+
+  // Точечный замер задержки с жестким таймаутом 3 сек
+  Future<void> _testNodePing(ServerNode node, {bool force = false}) async {
+    if (!mounted) return;
+    if (!force && node.ping == -2) return;
+
     setState(() => node.ping = -2);
 
     try {
-      final v2rayURL = FlutterV2ray.parseFromURL(node.rawConfig);
+      int delay = -1;
 
-      // Правильный каскад DNS с поддержкой DoH и Smart DNS
-      v2rayURL.dns = {
-        "servers": [
-          "https://dns.google/dns-query",
-          "8.8.8.8",
-          "1.1.1.1",
-          "111.88.96.50", // Xbox DNS / Smart DNS
-          "77.88.8.8"     // Яндекс DNS
-        ],
-        "queryStrategy": "UseIP"
-      };
+      final activeList = currentTab == 0 ? autoServers : customServers;
+      final isCurrentlyConnectedNode = isConnected &&
+          activeList.isNotEmpty &&
+          selectedIndex < activeList.length &&
+          activeList[selectedIndex] == node;
 
-      final delay = await flutterV2ray.getServerDelay(config: v2rayURL.getFullConfiguration());
+      if (isCurrentlyConnectedNode) {
+        // Замер активного соединения через рабочий туннель
+        delay = await flutterV2ray
+            .getConnectedServerDelay(url: 'https://cp.cloudflare.com/generate_204')
+            .timeout(const Duration(seconds: 3), onTimeout: () => -1);
+      } else {
+        // Автономный замер конфигурации
+        final v2rayURL = FlutterV2ray.parseFromURL(node.rawConfig);
+
+        v2rayURL.dns = {
+          "servers": [
+            "https://dns.google/dns-query",
+            "8.8.8.8",
+            "1.1.1.1",
+            "111.88.96.50",
+            "77.88.8.8"
+          ],
+          "queryStrategy": "UseIP"
+        };
+
+        delay = await flutterV2ray
+            .getServerDelay(
+              config: v2rayURL.getFullConfiguration(),
+              url: 'https://cp.cloudflare.com/generate_204',
+            )
+            .timeout(const Duration(seconds: 3), onTimeout: () => -1);
+      }
+
       if (mounted) {
         setState(() {
           node.ping = delay;
@@ -312,7 +367,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     );
   }
 
-  // ЗАПУСК И МГНОВЕННОЕ ВЫКЛЮЧЕНИЕ
   void _handleToggle() async {
     final activeList = currentTab == 0 ? autoServers : customServers;
     if (activeList.isEmpty) {
@@ -320,9 +374,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       return;
     }
 
-    // МГНОВЕННОЕ И ПРИНУДИТЕЛЬНОЕ ВЫКЛЮЧЕНИЕ
     if (isConnected || isConnecting) {
-      _isManuallyStopped = true; // Блокируем гонку потоков
+      _isManuallyStopped = true;
       setState(() {
         isConnected = false;
         isConnecting = false;
@@ -350,19 +403,17 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       if (permissionGranted) {
         final v2rayURL = FlutterV2ray.parseFromURL(activeNode.rawConfig);
 
-        // 1. Умный каскадный DNS
         v2rayURL.dns = {
           "servers": [
             "https://dns.google/dns-query",
             "8.8.8.8",
             "1.1.1.1",
-            "111.88.96.50", // Xbox DNS
+            "111.88.96.50",
             "77.88.8.8"
           ],
           "queryStrategy": "UseIP"
         };
 
-        // 2. Включаем Sniffing как в v2rayNG
         try {
           v2rayURL.inbound['sniffing'] = {
             "enabled": true,
@@ -371,7 +422,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           };
         } catch (_) {}
 
-        // 3. Маршрутизация DNS через прокси-туннель для защиты от ТСПУ
         try {
           List rules = v2rayURL.routing['rules'] ?? [];
           rules.insert(0, {
@@ -383,7 +433,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           v2rayURL.routing['domainStrategy'] = "IPIfNonMatch";
         } catch (_) {}
 
-        // Запуск туннеля без дропа подсетей
         await flutterV2ray.startV2Ray(
           remark: activeNode.name,
           config: v2rayURL.getFullConfiguration(),
@@ -489,7 +538,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               });
 
               _saveCustomKeysToStorage();
-              _testNodePing(newNode);
+              _testNodePing(newNode, force: true);
               Navigator.pop(context);
               _showToast("Ключ сохранен", isSuccess: true);
             },
@@ -521,17 +570,17 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             crossAxisAlignment: CrossAxisAlignment.start,
             children: const [
               Text(
-                "Как работает Scale VPN:",
+                "Принципы работы Scale VPN:",
                 style: TextStyle(color: Color(0xFFC5A059), fontWeight: FontWeight.bold, fontSize: 13),
               ),
               SizedBox(height: 8),
               Text(
-                "1. Автономный сбор с GitHub:\n"
-                "Приложение опрашивает открытые базы VLESS Reality и Shadowsocks, автоматически обновляемые каждые 15 минут.\n\n"
-                "2. Экспресс-замер и зачистка:\n"
-                "Все найденные узлы тестируются параллельно. Серверы без ответа автоматически исключаются из списка.\n\n"
-                "3. Защита от блокировок DNS:\n"
-                "Запросы маршрутизируются внутри туннеля через каскад DoH (Google, Cloudflare, Smart DNS, Yandex), обходя ТСПУ провайдера.",
+                "1. Сбор реестров GitHub:\n"
+                "Опрос открытых источников VLESS Reality каждые 15 минут.\n\n"
+                "2. Пакетная валидация задержки:\n"
+                "Опрос узлов группами через Anycast Cloudflare с таймаутом 3 секунды. Узлы без отклика отсекаются.\n\n"
+                "3. DNS-туннелирование:\n"
+                "DNS-трафик на порт 53 инкапсулируется в зашифрованный туннель с DoH каскадом.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
             ],
@@ -618,7 +667,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                       IconButton(
                         icon: const Icon(Icons.cleaning_services_outlined, color: Color(0xFFC5A059), size: 20),
                         tooltip: "Удалить нерабочие ключи",
-                        onPressed: _validateAndPurgeDeadNodes,
+                        onPressed: _purgeDeadNodes,
                       ),
                       IconButton(
                         icon: const Icon(Icons.help_outline, color: Color(0xFFC5A059), size: 22),
@@ -729,7 +778,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                 children: [
                   Icon(Icons.speed, size: 15, color: isConnected ? const Color(0xFFC5A059) : const Color(0xFF6B635B)),
                   const SizedBox(width: 8),
-                  Text("Пинг: ", style: const TextStyle(color: Color(0xFFD6D3D1), fontSize: 11)),
+                  const Text("Пинг: ", style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 11)),
                   activeNode != null
                       ? _buildPingBadge(activeNode.ping)
                       : const Text("—", style: TextStyle(color: Color(0xFF8C827A), fontSize: 11)),
@@ -765,7 +814,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                           IconButton(
                             icon: const Icon(Icons.cleaning_services, color: Color(0xFFC5A059), size: 18),
                             tooltip: "Очистить мертвые узлы",
-                            onPressed: _validateAndPurgeDeadNodes,
+                            onPressed: _purgeDeadNodes,
                           ),
                           if (currentTab == 1)
                             IconButton(
@@ -797,8 +846,11 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                               final isCurrent = idx == selectedIndex;
                               return GestureDetector(
                                 onTap: () {
+                                  // Переключение выбора без сброса готового пинга
                                   setState(() => selectedIndex = idx);
-                                  _testNodePing(item);
+                                  if (item.ping == -2) {
+                                    _testNodePing(item);
+                                  }
                                 },
                                 child: Container(
                                   margin: const EdgeInsets.only(bottom: 6),
@@ -846,7 +898,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                           IconButton(
                                             icon: const Icon(Icons.network_check, size: 16, color: Color(0xFFC5A059)),
                                             tooltip: "Замерить задержку",
-                                            onPressed: () => _testNodePing(item),
+                                            onPressed: () => _testNodePing(item, force: true),
                                           ),
                                           IconButton(
                                             icon: const Icon(Icons.copy, size: 15, color: Color(0xFF8C827A)),
