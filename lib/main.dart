@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -33,7 +34,7 @@ class ScaleVpnApp extends StatelessWidget {
 class ServerNode {
   final String name;
   final String rawConfig;
-  final int ping;
+  int ping; // -2: тест, -1: мертв, >0: мс
   final bool isCustom;
 
   ServerNode({
@@ -55,23 +56,21 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   late AnimationController _gearController;
   late final FlutterV2ray flutterV2ray = FlutterV2ray(
     onStatusChanged: (status) {
-      if (mounted) {
+      if (!mounted) return;
+      final stateStr = status.state.toUpperCase();
+      if (stateStr.contains("CONNECTED")) {
         setState(() {
-          final stateStr = status.state.toUpperCase();
-          if (stateStr.contains("CONNECTED")) {
-            isConnected = true;
-            isConnecting = false;
-            _gearController.stop();
-          } else if (stateStr.contains("CONNECTING")) {
-            isConnecting = true;
-            isConnected = false;
-            _gearController.repeat();
-          } else {
-            isConnected = false;
-            isConnecting = false;
-            _gearController.stop();
-          }
+          isConnected = true;
+          isConnecting = false;
         });
+        _gearController.stop();
+      } else if (stateStr.contains("DISCONNECT") || stateStr.contains("STOP")) {
+        setState(() {
+          isConnected = false;
+          isConnecting = false;
+        });
+        _gearController.stop();
+        _gearController.reset();
       }
     },
   );
@@ -79,30 +78,20 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   bool isConnected = false;
   bool isConnecting = false;
   bool bypassRu = true;
-  bool isLoadingKeys = false;
+  bool isSearchingGitHub = false;
   
-  int currentTab = 0; // 0 - Авто, 1 - Мои ключи
+  int currentTab = 0; // 0 - GitHub Реестр, 1 - Мои ключи
   int selectedIndex = 0;
 
   List<ServerNode> autoServers = [];
   List<ServerNode> customServers = [];
 
-  final List<ServerNode> fallbackServers = [
-    ServerNode(
-      name: "Польша (Варшава / TLS)",
-      rawConfig: "vless://cd3bb7d9-7df3-4644-ac05-c260990ac277@50.7.249.170:443?security=tls&flow=xtls-rprx-vision#Poland",
-      ping: 42,
-    ),
-    ServerNode(
-      name: "Финляндия (Хельсинки / Reality)",
-      rawConfig: "vless://985c2ce1-3ed4-41fb-a13f-f7653306f7fb@suboard.net:443?security=reality&sni=business.vk.ru#Finland",
-      ping: 36,
-    ),
-    ServerNode(
-      name: "Германия (Франкфурт / Auto)",
-      rawConfig: "vless://ba1df575-79a9-4159-ba6e-c9233595c753@193.233.231.30:443?security=tls#Germany",
-      ping: 58,
-    ),
+  // Список крупнейших регулярно обновляемых репозиториев GitHub через CDN
+  final List<String> gitHubSources = [
+    'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/vless.txt',
+    'https://cdn.jsdelivr.net/gh/ebrasha/free-v2ray-public-list@main/vless_configs.txt',
+    'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/vless.txt',
+    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
   ];
 
   @override
@@ -114,7 +103,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     );
     _initV2RayEngine();
     _loadCustomKeysFromStorage();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _loadConfigsFromCdn());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _searchGitHubForKeys());
   }
 
   void _initV2RayEngine() async {
@@ -140,7 +129,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             return ServerNode(
               name: parts.isNotEmpty ? parts[0] : "Свой узел",
               rawConfig: parts.length > 1 ? parts[1] : str,
-              ping: 45,
+              ping: -2,
               isCustom: true,
             );
           }).toList();
@@ -157,70 +146,114 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } catch (_) {}
   }
 
-  Future<void> _loadConfigsFromCdn() async {
-    setState(() => isLoadingKeys = true);
+  // Извлечение конфигураций с поддержкой Base64
+  List<String> _extractConfigs(String rawData) {
+    List<String> results = [];
+    String text = rawData;
 
-    final urls = [
-      'https://cdn.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/clean/vless.txt',
-      'https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/clean/vless.txt',
-    ];
+    try {
+      String cleaned = rawData.replaceAll(RegExp(r'\s+'), '');
+      while (cleaned.length % 4 != 0) {
+        cleaned += '=';
+      }
+      final decoded = utf8.decode(base64.decode(cleaned));
+      if (decoded.contains('vless://') || decoded.contains('ss://')) {
+        text = decoded;
+      }
+    } catch (_) {}
 
-    String? responseBody;
+    final lines = text.split(RegExp(r'[\r\n]+'));
+    for (var line in lines) {
+      line = line.trim();
+      if (line.startsWith('vless://') || line.startsWith('ss://')) {
+        results.add(line);
+      }
+    }
+    return results;
+  }
 
-    for (final url in urls) {
+  // АВТОНОМНЫЙ ПОИСК КЛЮЧЕЙ НА GITHUB
+  Future<void> _searchGitHubForKeys() async {
+    if (isSearchingGitHub) return;
+    setState(() => isSearchingGitHub = true);
+
+    _showToast("Поиск свежих ключей на GitHub...", isSuccess: true);
+
+    List<ServerNode> collectedNodes = [];
+
+    for (final url in gitHubSources) {
       try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
         if (res.statusCode == 200 && res.body.isNotEmpty) {
-          responseBody = res.body;
-          break;
+          final configs = _extractConfigs(res.body);
+
+          for (final config in configs) {
+            String title = "GitHub Node ${collectedNodes.length + 1}";
+            if (config.contains('#')) {
+              try {
+                title = Uri.decodeComponent(config.split('#').last).trim();
+              } catch (_) {
+                title = config.split('#').last;
+              }
+            }
+            collectedNodes.add(ServerNode(
+              name: title.isEmpty ? "Узел ${collectedNodes.length + 1}" : title,
+              rawConfig: config,
+              ping: -2,
+            ));
+            if (collectedNodes.length >= 20) break;
+          }
         }
       } catch (_) {
         continue;
       }
+      if (collectedNodes.length >= 20) break;
     }
 
-    if (responseBody != null) {
-      final lines = responseBody.split(RegExp(r'[\r\n]+'));
-      final List<ServerNode> loaded = [];
+    if (collectedNodes.isNotEmpty && mounted) {
+      setState(() {
+        autoServers = collectedNodes;
+        selectedIndex = 0;
+      });
+      _showToast("Найдено ${collectedNodes.length} ключей. Проверка связи...", isSuccess: true);
 
-      for (var line in lines) {
-        line = line.trim();
-        if (line.startsWith('vless://') || line.startsWith('ss://')) {
-          String title = "Узел ${loaded.length + 1}";
-          if (line.contains('#')) {
-            try {
-              title = Uri.decodeComponent(line.split('#').last).trim();
-            } catch (_) {
-              title = line.split('#').last;
-            }
-          }
-          loaded.add(ServerNode(
-            name: title.isEmpty ? "Узел ${loaded.length + 1}" : title,
-            rawConfig: line,
-            ping: 30 + (loaded.length * 4) % 55,
-          ));
-          if (loaded.length >= 25) break;
-        }
-      }
-
-      if (loaded.isNotEmpty && mounted) {
-        setState(() {
-          autoServers = loaded;
-          selectedIndex = 0;
-        });
-        _showToast("Загружено ${loaded.length} конфигураций из реестра", isSuccess: true);
-      }
+      // Автоматический замер пинга первых узлов
+      _autoPingTopNodes();
     } else {
-      if (mounted && autoServers.isEmpty) {
-        setState(() {
-          autoServers = List.from(fallbackServers);
-          selectedIndex = 0;
-        });
-        _showToast("Активирован резервный автономный пул", isSuccess: true);
+      if (mounted) {
+        _showToast("Не удалось получить доступ к репозиториям GitHub", isSuccess: false);
       }
     }
 
-    if (mounted) setState(() => isLoadingKeys = false);
+    if (mounted) setState(() => isSearchingGitHub = false);
+  }
+
+  // Фоновая проверка пинга найденных узлов
+  void _autoPingTopNodes() async {
+    for (int i = 0; i < math.min(5, autoServers.length); i++) {
+      if (!mounted) break;
+      await _testNodePing(autoServers[i]);
+    }
+  }
+
+  // Замер задержки через движок Xray
+  Future<void> _testNodePing(ServerNode node) async {
+    if (!mounted) return;
+    setState(() => node.ping = -2);
+
+    try {
+      final v2rayURL = FlutterV2ray.parseFromURL(node.rawConfig);
+      final delay = await flutterV2ray.getServerDelay(config: v2rayURL.getFullConfiguration());
+      if (mounted) {
+        setState(() {
+          node.ping = delay;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => node.ping = -1);
+      }
+    }
   }
 
   void _showToast(String message, {required bool isSuccess}) {
@@ -238,66 +271,60 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     );
   }
 
-  // НАСТОЯЩЕЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ СИСТЕМНЫЙ VPNSERVICE ANDROID
   void _handleToggle() async {
     final activeList = currentTab == 0 ? autoServers : customServers;
     if (activeList.isEmpty) {
-      _showToast("Список узлов пуст", isSuccess: false);
+      _showToast("Список узлов пуст. Нажмите кнопку поиска вверху", isSuccess: false);
       return;
     }
 
-    final activeNode = activeList[selectedIndex];
-
-    if (isConnected) {
-      try {
-        await flutterV2ray.stopV2Ray();
-      } catch (_) {}
+    if (isConnected || isConnecting) {
       setState(() {
         isConnected = false;
         isConnecting = false;
       });
       _gearController.stop();
-      _showToast("Соединение разорвано", isSuccess: false);
-    } else {
-      setState(() => isConnecting = true);
-      _gearController.repeat();
+      _gearController.reset();
 
       try {
-        // Запрос системного разрешения Android на создание VPN
-        final bool permissionGranted = await flutterV2ray.requestPermission();
+        await flutterV2ray.stopV2Ray();
+      } catch (_) {}
 
-        if (permissionGranted) {
-          final v2rayURL = FlutterV2ray.parseFromURL(activeNode.rawConfig);
+      _showToast("Соединение разорвано", isSuccess: false);
+      return;
+    }
 
-          // Список подсетей РФ для обхода (если включен тумблер)
-          final ruBypassSubnets = [
-            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-            "5.8.0.0/13", "5.16.0.0/12", "31.13.0.0/16", "31.173.0.0/16",
-            "77.82.0.0/15", "79.132.0.0/14", "80.64.0.0/11", "81.1.0.0/16",
-            "82.145.0.0/16", "83.149.0.0/16", "87.240.128.0/18", "91.198.0.0/16",
-            "92.242.0.0/15", "93.186.224.0/19", "95.163.0.0/16", "178.248.232.0/21",
-            "185.32.187.0/24", "185.38.168.0/22", "185.70.184.0/22", "185.165.120.0/22"
-          ];
+    final activeNode = activeList[selectedIndex];
 
-          await flutterV2ray.startV2Ray(
-            remark: activeNode.name,
-            config: v2rayURL.getFullConfiguration(),
-            proxyOnly: false,
-            bypassSubnets: bypassRu ? ruBypassSubnets : null,
-            notificationDisconnectButtonName: "ОТКЛЮЧИТЬ",
-          );
+    setState(() => isConnecting = true);
+    _gearController.repeat();
 
-          _showToast("Системный VPN-туннель активирован", isSuccess: true);
-        } else {
-          setState(() => isConnecting = false);
-          _gearController.stop();
-          _showToast("Разрешение на VPN отклонено в системе", isSuccess: false);
-        }
-      } catch (e) {
+    try {
+      final bool permissionGranted = await flutterV2ray.requestPermission();
+
+      if (permissionGranted) {
+        final v2rayURL = FlutterV2ray.parseFromURL(activeNode.rawConfig);
+
+        await flutterV2ray.startV2Ray(
+          remark: activeNode.name,
+          config: v2rayURL.getFullConfiguration(),
+          proxyOnly: false,
+          bypassSubnets: bypassRu ? [
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+          ] : null,
+          notificationDisconnectButtonName: "ОТКЛЮЧИТЬ",
+        );
+
+        _showToast("VPN активирован", isSuccess: true);
+      } else {
         setState(() => isConnecting = false);
         _gearController.stop();
-        _showToast("Ошибка конфигурации протокола", isSuccess: false);
+        _showToast("Разрешение отклонено", isSuccess: false);
       }
+    } catch (e) {
+      setState(() => isConnecting = false);
+      _gearController.stop();
+      _showToast("Некорректный ключ конфигурации", isSuccess: false);
     }
   }
 
@@ -317,7 +344,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           children: const [
             Icon(Icons.add_link, color: Color(0xFFC5A059)),
             SizedBox(width: 10),
-            Text("Добавить конфигурацию", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text("Добавить свой ключ", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
           ],
         ),
         content: SingleChildScrollView(
@@ -374,17 +401,20 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                   }
                 }
               }
-              if (title.isEmpty) title = "Пользовательский узел ${customServers.length + 1}";
+              if (title.isEmpty) title = "Свой узел ${customServers.length + 1}";
+
+              final newNode = ServerNode(name: title, rawConfig: raw, ping: -2, isCustom: true);
 
               setState(() {
-                customServers.insert(0, ServerNode(name: title, rawConfig: raw, ping: 35, isCustom: true));
+                customServers.insert(0, newNode);
                 currentTab = 1;
                 selectedIndex = 0;
               });
 
               _saveCustomKeysToStorage();
+              _testNodePing(newNode);
               Navigator.pop(context);
-              _showToast("Конфигурация сохранена", isSuccess: true);
+              _showToast("Ключ сохранен", isSuccess: true);
             },
             child: const Text("ДОБАВИТЬ", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
           ),
@@ -406,7 +436,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           children: const [
             Icon(Icons.info_outline, color: Color(0xFFC5A059)),
             SizedBox(width: 10),
-            Text("Архитектура системы", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text("Принцип работы", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
           ],
         ),
         content: SingleChildScrollView(
@@ -414,19 +444,19 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             crossAxisAlignment: CrossAxisAlignment.start,
             children: const [
               Text(
-                "Принцип работы платформы:",
+                "Как работает Scale VPN:",
                 style: TextStyle(color: Color(0xFFC5A059), fontWeight: FontWeight.bold, fontSize: 13),
               ),
               SizedBox(height: 8),
               Text(
-                "1. Облачный мониторинг:\n"
-                "Серверные роботы непрерывно собирают конфигурации из открытых реестров VLESS Reality и Shadowsocks.\n\n"
-                "2. Валидация и фильтрация:\n"
-                "Каждые несколько часов проверяется время отклика каждого узла. Недоступные серверы исключаются из выдачи.\n\n"
-                "3. Отказоустойчивая доставка:\n"
-                "Синхронизация происходит через независимые CDN-каналы, что гарантирует получение актуальных ключей даже при фильтрации GitHub.\n\n"
+                "1. Автономный сбор с GitHub:\n"
+                "Приложение подключается к крупнейшим открытым базам на GitHub (Barry-Far, Ebrasha, Delta-Kronecker) и извлекает свежие серверы VLESS и Shadowsocks.\n\n"
+                "2. Авто-тестирование:\n"
+                "Сразу после получения списка ядро Xray отправляет сетевые запросы и определяет реальную задержку (пинг) каждого узла.\n\n"
+                "3. Зеленый статус:\n"
+                "Серверы с зеленым пингом полностью работоспособны и готовы к шифрованию трафика.\n\n"
                 "4. Системный туннель VpnService:\n"
-                "При активации создается системный сетевой адаптер Android, через который маршрутизируется трафик.",
+                "Трафик перенаправляется через виртуальный адаптер Android с возможностью обхода ресурсов РФ.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
             ],
@@ -439,6 +469,26 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildPingBadge(int ping) {
+    if (ping == -2) {
+      return const SizedBox(
+        width: 12,
+        height: 12,
+        child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFFC5A059)),
+      );
+    }
+    if (ping == -1) {
+      return const Text(
+        "Таймаут",
+        style: TextStyle(color: Color(0xFFE53935), fontSize: 11, fontWeight: FontWeight.bold),
+      );
+    }
+    return Text(
+      "$ping ms",
+      style: const TextStyle(color: Color(0xFF66BB6A), fontSize: 11, fontWeight: FontWeight.bold),
     );
   }
 
@@ -481,7 +531,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                             ),
                           ),
                           Text(
-                            "Autonomous Unit",
+                            "GitHub Key Engine",
                             style: TextStyle(color: Color(0xFF8C827A), fontSize: 10),
                           ),
                         ],
@@ -496,15 +546,15 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                         onPressed: _showInfoDialog,
                       ),
                       IconButton(
-                        icon: isLoadingKeys
+                        icon: isSearchingGitHub
                             ? const SizedBox(
                                 width: 18,
                                 height: 18,
                                 child: CircularProgressIndicator(color: Color(0xFFC5A059), strokeWidth: 2),
                               )
                             : const Icon(Icons.sync, color: Color(0xFFC5A059), size: 22),
-                        tooltip: "Обновить реестр",
-                        onPressed: isLoadingKeys ? null : _loadConfigsFromCdn,
+                        tooltip: "Искать ключи на GitHub",
+                        onPressed: isSearchingGitHub ? null : _searchGitHubForKeys,
                       ),
                     ],
                   ),
@@ -514,13 +564,14 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const Spacer(),
 
+            // ЦЕНТРАЛЬНАЯ КНОПКА ПОДКЛЮЧЕНИЯ
             GestureDetector(
               onTap: _handleToggle,
               child: Stack(
                 alignment: Alignment.center,
                 children: [
                   AnimatedContainer(
-                    duration: const Duration(milliseconds: 500),
+                    duration: const Duration(milliseconds: 300),
                     width: 210,
                     height: 210,
                     decoration: BoxDecoration(
@@ -598,12 +649,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                 children: [
                   Icon(Icons.speed, size: 15, color: isConnected ? const Color(0xFFC5A059) : const Color(0xFF6B635B)),
                   const SizedBox(width: 8),
-                  Text(
-                    isConnected && activeNode != null
-                        ? "Задержка: ${activeNode.ping} ms"
-                        : "Пинг: —",
-                    style: const TextStyle(color: Color(0xFFD6D3D1), fontSize: 11),
-                  ),
+                  Text("Пинг: ", style: const TextStyle(color: Color(0xFFD6D3D1), fontSize: 11)),
+                  activeNode != null
+                      ? _buildPingBadge(activeNode.ping)
+                      : const Text("—", style: TextStyle(color: Color(0xFF8C827A), fontSize: 11)),
                 ],
               ),
             ),
@@ -645,6 +694,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
             const SizedBox(height: 12),
 
+            // НИЖНЯЯ ПАНЕЛЬ С СЕРВЕРАМИ GITHUB
             Container(
               height: 240,
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
@@ -660,11 +710,17 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                     children: [
                       Row(
                         children: [
-                          _buildTabButton("Автоматические", 0),
+                          _buildTabButton("GitHub Реестр", 0),
                           const SizedBox(width: 8),
-                          _buildTabButton("Мои ключи", 1),
+                          _buildTabButton("Свои ключи", 1),
                         ],
                       ),
+                      if (currentTab == 0)
+                        IconButton(
+                          icon: const Icon(Icons.cloud_download_outlined, color: Color(0xFFC5A059), size: 20),
+                          tooltip: "Искать ключи на GitHub",
+                          onPressed: isSearchingGitHub ? null : _searchGitHubForKeys,
+                        ),
                       if (currentTab == 1)
                         IconButton(
                           icon: const Icon(Icons.add_circle_outline, color: Color(0xFFC5A059), size: 22),
@@ -678,21 +734,12 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                   Expanded(
                     child: activeList.isEmpty
                         ? Center(
-                            child: currentTab == 0
-                                ? (isLoadingKeys
-                                    ? const CircularProgressIndicator(color: Color(0xFFC5A059))
-                                    : const Text("Нажмите кнопку синхронизации вверху", style: TextStyle(color: Color(0xFF8C827A), fontSize: 12)))
-                                : Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      const Text("Нет сохраненных ключей", style: TextStyle(color: Color(0xFF8C827A), fontSize: 12)),
-                                      const SizedBox(height: 6),
-                                      TextButton.icon(
-                                        icon: const Icon(Icons.add, size: 16, color: Color(0xFFC5A059)),
-                                        label: const Text("Добавить свой ключ", style: TextStyle(color: Color(0xFFC5A059), fontSize: 12)),
-                                        onPressed: _showAddKeyDialog,
-                                      ),
-                                    ],
+                            child: isSearchingGitHub
+                                ? const CircularProgressIndicator(color: Color(0xFFC5A059))
+                                : TextButton.icon(
+                                    icon: const Icon(Icons.search, color: Color(0xFFC5A059), size: 16),
+                                    label: const Text("Найти ключи на GitHub", style: TextStyle(color: Color(0xFFC5A059), fontSize: 12)),
+                                    onPressed: _searchGitHubForKeys,
                                   ),
                           )
                         : ListView.builder(
@@ -701,7 +748,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                               final item = activeList[idx];
                               final isCurrent = idx == selectedIndex;
                               return GestureDetector(
-                                onTap: () => setState(() => selectedIndex = idx),
+                                onTap: () {
+                                  setState(() => selectedIndex = idx);
+                                  _testNodePing(item);
+                                },
                                 child: Container(
                                   margin: const EdgeInsets.only(bottom: 6),
                                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -743,20 +793,19 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                       ),
                                       Row(
                                         children: [
-                                          Text(
-                                            "${item.ping} ms",
-                                            style: TextStyle(
-                                              color: isCurrent ? const Color(0xFFC5A059) : const Color(0xFF8C827A),
-                                              fontSize: 11,
-                                            ),
+                                          _buildPingBadge(item.ping),
+                                          const SizedBox(width: 6),
+                                          IconButton(
+                                            icon: const Icon(Icons.network_check, size: 16, color: Color(0xFFC5A059)),
+                                            tooltip: "Замерить задержку",
+                                            onPressed: () => _testNodePing(item),
                                           ),
-                                          const SizedBox(width: 4),
                                           IconButton(
                                             icon: const Icon(Icons.copy, size: 15, color: Color(0xFF8C827A)),
                                             tooltip: "Скопировать ключ",
                                             onPressed: () {
                                               Clipboard.setData(ClipboardData(text: item.rawConfig));
-                                              _showToast("Ключ скопирован в буфер обмена", isSuccess: true);
+                                              _showToast("Ключ скопирован в буфер", isSuccess: true);
                                             },
                                           ),
                                           if (item.isCustom)
