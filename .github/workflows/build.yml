@@ -1,4 +1,4 @@
-name: Build Scale VPN (APK & Windows)
+name: Build Scale VPN (APK)
 
 on:
   push:
@@ -31,11 +31,12 @@ jobs:
           flutter create --project-name scale_vpn --platforms=android --org com.scalevpn .
           cp pubspec.backup.yaml pubspec.yaml
           
-          # ЖЕЛЕЗОБЕТОННОЕ повышение версии Android до 24 (требование Xray)
-          sed -i 's/flutter.minSdkVersion/24/g' android/app/build.gradle
+          # Универсальное повышение версии до 24 для build.gradle и build.gradle.kts
+          find android/ -type f -name "build.gradle*" -exec sed -i 's/flutter.minSdkVersion/24/g' {} + || true
+          find android/ -type f -name "build.gradle*" -exec sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/g' {} + || true
           
           # Добавляем права на уведомления (Android 13+) и системный VPN
-          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>' android/app/src/main/AndroidManifest.xml
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>' android/app/src/main/AndroidManifest.xml || true
           
           flutter pub get
 
@@ -47,34 +48,3 @@ jobs:
         with:
           name: ScaleVPN-Android
           path: build/app/outputs/flutter-apk/app-release.apk
-
-  build-windows:
-    name: Сборка Windows Desktop
-    runs-on: windows-latest
-    continue-on-error: true # Сборка упадет из-за flutter_v2ray, но не прервет выдачу APK
-    steps:
-      - name: Скачивание репозитория
-        uses: actions/checkout@v4
-
-      - name: Установка Flutter SDK
-        uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          cache: true
-
-      - name: Генерация Windows
-        shell: bash
-        run: |
-          cp pubspec.yaml pubspec.backup.yaml
-          flutter create --project-name scale_vpn --platforms=windows --org com.scalevpn .
-          cp pubspec.backup.yaml pubspec.yaml
-          flutter pub get
-
-      - name: Компиляция для Windows
-        run: flutter build windows --release
-
-      - name: Выгрузка программы для Windows
-        uses: actions/upload-artifact@v4
-        with:
-          name: ScaleVPN-Windows
-          path: build/windows/x64/runner/Release/
