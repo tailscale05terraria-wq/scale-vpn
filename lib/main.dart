@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -65,11 +66,12 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   late AnimationController _gearController;
   
   bool _isManuallyStopped = false;
+  bool _isReconnecting = false;
 
   late final FlutterV2ray flutterV2ray = FlutterV2ray(
     onStatusChanged: (status) {
       if (!mounted) return;
-      if (_isManuallyStopped) return;
+      if (_isManuallyStopped || _isReconnecting) return;
 
       final stateStr = status.state.toUpperCase().trim();
 
@@ -142,11 +144,9 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     try {
       final prefs = await SharedPreferences.getInstance();
       
-      // Загрузка закрепленных ключей
       final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
       pinnedConfigs = pinnedList.toSet();
 
-      // Загрузка пользовательских ключей
       final saved = prefs.getStringList('custom_vpn_keys') ?? [];
       if (saved.isNotEmpty) {
         setState(() {
@@ -182,7 +182,35 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } catch (_) {}
   }
 
-  // Парсинг сетевого адреса и порта для прямого TCP-замера
+  // Генератор валидной конфигурации по стандарту v2rayNG
+  String _buildCleanConfig(String rawConfig) {
+    final v2rayURL = FlutterV2ray.parseFromURL(rawConfig);
+
+    // Только чистые валидные IP-адреса для системного VpnService Android
+    v2rayURL.dns = {
+      "servers": [
+        "1.1.1.1",
+        "8.8.8.8",
+        "1.0.0.1",
+        "8.8.4.4"
+      ],
+      "queryStrategy": "UseIP"
+    };
+
+    // Сниффинг строго как в v2rayNG: только http и tls
+    try {
+      v2rayURL.inbound['sniffing'] = {
+        "enabled": true,
+        "destOverride": ["http", "tls"],
+        "routeOnly": false
+      };
+    } catch (_) {}
+
+    final Map<String, dynamic> configMap = jsonDecode(v2rayURL.getFullConfiguration());
+    return jsonEncode(configMap);
+  }
+
+  // Парсер сетевого эндпоинта для быстрого предварительного отсева
   ServerEndpoint? _parseEndpoint(String rawConfig) {
     try {
       final uri = Uri.tryParse(rawConfig);
@@ -230,27 +258,20 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return null;
   }
 
-  // Экспресс-замер задержки TCP Handshake (TCPing)
-  Future<int> _measureTcpPing(String rawConfig) async {
-    final endpoint = _parseEndpoint(rawConfig);
-    if (endpoint == null) return -1;
-
-    final stopwatch = Stopwatch()..start();
+  // Экспресс-проверка доступности сокета перед тяжелым замером Xray
+  Future<bool> _fastTcpPreCheck(String rawConfig) async {
+    final ep = _parseEndpoint(rawConfig);
+    if (ep == null) return false;
     try {
-      final socket = await Socket.connect(
-        endpoint.host,
-        endpoint.port,
-        timeout: const Duration(milliseconds: 1500),
-      );
-      stopwatch.stop();
+      final socket = await Socket.connect(ep.host, ep.port, timeout: const Duration(milliseconds: 900));
       socket.destroy();
-      return stopwatch.elapsedMilliseconds;
+      return true;
     } catch (_) {
-      return -1;
+      return false;
     }
   }
 
-  // Сортировка: закрепленные сверху, далее по возрастанию пинга (лучшие первыми)
+  // Сортировка: закрепленные сверху, далее лучшие по пингу
   void _sortNodes(List<ServerNode> list) {
     final currentSelected = (list.isNotEmpty && selectedIndex < list.length)
         ? list[selectedIndex]
@@ -318,6 +339,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return results;
   }
 
+  // Поиск и конвейерный замер
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
     setState(() => isSearchingGitHub = true);
@@ -326,7 +348,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
     List<ServerNode> collectedNodes = [];
 
-    // Сохраняем ранее закрепленные узлы
     final existingPinned = autoServers.where((s) => s.isPinned).toList();
     collectedNodes.addAll(existingPinned);
 
@@ -355,13 +376,13 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               ping: -2,
               isPinned: isPinned,
             ));
-            if (collectedNodes.length >= 18) break;
+            if (collectedNodes.length >= 16) break;
           }
         }
       } catch (_) {
         continue;
       }
-      if (collectedNodes.length >= 18) break;
+      if (collectedNodes.length >= 16) break;
     }
 
     if (collectedNodes.isNotEmpty && mounted) {
@@ -371,27 +392,19 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         selectedIndex = 0;
       });
 
-      _showToast("Получено ${collectedNodes.length} узлов. Экспресс-замер...", isSuccess: true);
+      _showToast("Получено ${collectedNodes.length} узлов. Тестирование задержки...", isSuccess: true);
 
-      // Параллельный замер TCPing с живым ранжированием на лету
-      await Future.wait(autoServers.map((node) async {
-        final delay = await _measureTcpPing(node.rawConfig);
-        if (mounted) {
-          setState(() {
-            node.ping = delay;
-            _sortNodes(autoServers);
-          });
-        }
-      }));
+      // Двухступенчатый замер: TCP-отсев + честный Xray Real Delay
+      await _testNodesPipeline(autoServers);
 
-      // Удаление нерабочих незакрепленных узлов
+      // Автоматическое удаление нерабочих незакрепленных узлов
       if (mounted) {
         setState(() {
           autoServers.removeWhere((s) => !s.isPinned && s.ping <= 0);
           _sortNodes(autoServers);
           if (selectedIndex >= autoServers.length) selectedIndex = 0;
         });
-        _showToast("Готово. Активных узлов: ${autoServers.length}", isSuccess: true);
+        _showToast("Проверка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
       }
     } else {
       if (mounted) {
@@ -402,8 +415,32 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     if (mounted) setState(() => isSearchingGitHub = false);
   }
 
-  // Точечный замер одного узла
-  Future<void> _testNodePing(ServerNode node) async {
+  // Конвейер: быстрый параллельный фильтр, затем честный Real Delay
+  Future<void> _testNodesPipeline(List<ServerNode> nodes) async {
+    List<ServerNode> candidates = [];
+
+    // Шаг 1: Мгновенный TCP-отсев мертвых IP (до 0.9 сек)
+    await Future.wait(nodes.map((node) async {
+      final reachable = await _fastTcpPreCheck(node.rawConfig);
+      if (reachable) {
+        candidates.add(node);
+      } else {
+        if (mounted) setState(() => node.ping = -1);
+      }
+    }));
+
+    // Шаг 2: Честный замер Real Delay через Xray только для живых серверов
+    const int chunkSize = 2;
+    for (int i = 0; i < candidates.length; i += chunkSize) {
+      if (!mounted) break;
+      final end = (i + chunkSize < candidates.length) ? i + chunkSize : candidates.length;
+      final chunk = candidates.sublist(i, end);
+      await Future.wait(chunk.map((node) => _testNodeRealDelay(node)));
+    }
+  }
+
+  // Честный замер Real Delay через ядро Xray (по стандарту v2rayNG)
+  Future<void> _testNodeRealDelay(ServerNode node) async {
     if (!mounted) return;
     setState(() => node.ping = -2);
 
@@ -414,18 +451,22 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         selectedIndex < activeList.length &&
         activeList[selectedIndex] == node;
 
-    if (isCurrentlyConnectedNode) {
-      try {
+    try {
+      if (isCurrentlyConnectedNode) {
         delay = await flutterV2ray
-            .getConnectedServerDelay(url: 'https://cp.cloudflare.com/generate_204')
-            .timeout(const Duration(milliseconds: 1500), onTimeout: () => -1);
-      } catch (_) {
-        delay = -1;
+            .getConnectedServerDelay(url: 'https://www.gstatic.com/generate_204')
+            .timeout(const Duration(milliseconds: 2500), onTimeout: () => -1);
+      } else {
+        final cleanConfig = _buildCleanConfig(node.rawConfig);
+        delay = await flutterV2ray
+            .getServerDelay(
+              config: cleanConfig,
+              url: 'https://www.gstatic.com/generate_204',
+            )
+            .timeout(const Duration(milliseconds: 2500), onTimeout: () => -1);
       }
-    }
-
-    if (delay <= 0) {
-      delay = await _measureTcpPing(node.rawConfig);
+    } catch (_) {
+      delay = -1;
     }
 
     if (mounted) {
@@ -436,7 +477,115 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     }
   }
 
-  // Очистка нерабочих узлов (закрепленные защищены от удаления)
+  // Выбор сервера с мягким переподключением на лету
+  Future<void> _selectAndSwitchServer(int idx) async {
+    final activeList = currentTab == 0 ? autoServers : customServers;
+    if (activeList.isEmpty || idx >= activeList.length) return;
+
+    final targetNode = activeList[idx];
+
+    // Если соединение активно и выбран другой сервер — выполняем переподключение
+    if ((isConnected || isConnecting) && idx != selectedIndex) {
+      setState(() {
+        selectedIndex = idx;
+        _isReconnecting = true;
+        isConnecting = true;
+        isConnected = false;
+      });
+      _gearController.repeat();
+
+      try {
+        await flutterV2ray.stopV2Ray();
+        await Future.delayed(const Duration(milliseconds: 150));
+        await _startTunnel(targetNode);
+      } catch (_) {
+        if (mounted) {
+          setState(() {
+            isConnecting = false;
+            isConnected = false;
+          });
+          _gearController.stop();
+          _showToast("Ошибка переподключения", isSuccess: false);
+        }
+      } finally {
+        if (mounted) setState(() => _isReconnecting = false);
+      }
+      return;
+    }
+
+    setState(() => selectedIndex = idx);
+
+    if (targetNode.ping == -2) {
+      _testNodeRealDelay(targetNode);
+    }
+  }
+
+  // Запуск VPN-туннеля
+  Future<void> _startTunnel(ServerNode node) async {
+    _isManuallyStopped = false;
+    setState(() => isConnecting = true);
+    _gearController.repeat();
+
+    try {
+      final bool permissionGranted = await flutterV2ray.requestPermission();
+
+      if (permissionGranted) {
+        final cleanConfig = _buildCleanConfig(node.rawConfig);
+
+        await flutterV2ray.startV2Ray(
+          remark: node.name,
+          config: cleanConfig,
+          proxyOnly: false,
+          bypassSubnets: null,
+          notificationDisconnectButtonName: "ОТКЛЮЧИТЬ",
+        );
+
+        if (mounted) {
+          _showToast("VPN активирован: ${node.name}", isSuccess: true);
+        }
+      } else {
+        if (mounted) {
+          setState(() => isConnecting = false);
+          _gearController.stop();
+          _showToast("Разрешение отклонено", isSuccess: false);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => isConnecting = false);
+        _gearController.stop();
+        _showToast("Ошибка конфигурации узла", isSuccess: false);
+      }
+    }
+  }
+
+  void _handleToggle() async {
+    final activeList = currentTab == 0 ? autoServers : customServers;
+    if (activeList.isEmpty) {
+      _showToast("Список узлов пуст. Нажмите поиск вверху", isSuccess: false);
+      return;
+    }
+
+    if (isConnected || isConnecting) {
+      _isManuallyStopped = true;
+      setState(() {
+        isConnected = false;
+        isConnecting = false;
+      });
+      _gearController.stop();
+      _gearController.reset();
+
+      try {
+        await flutterV2ray.stopV2Ray();
+      } catch (_) {}
+
+      _showToast("Соединение разорвано", isSuccess: false);
+      return;
+    }
+
+    _startTunnel(activeList[selectedIndex]);
+  }
+
   void _purgeDeadNodes() {
     final list = currentTab == 0 ? autoServers : customServers;
     if (list.isEmpty) return;
@@ -473,93 +622,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
     );
-  }
-
-  void _handleToggle() async {
-    final activeList = currentTab == 0 ? autoServers : customServers;
-    if (activeList.isEmpty) {
-      _showToast("Список узлов пуст. Нажмите поиск вверху", isSuccess: false);
-      return;
-    }
-
-    if (isConnected || isConnecting) {
-      _isManuallyStopped = true;
-      setState(() {
-        isConnected = false;
-        isConnecting = false;
-      });
-      _gearController.stop();
-      _gearController.reset();
-
-      try {
-        await flutterV2ray.stopV2Ray();
-      } catch (_) {}
-
-      _showToast("Соединение разорвано", isSuccess: false);
-      return;
-    }
-
-    _isManuallyStopped = false;
-    final activeNode = activeList[selectedIndex];
-
-    setState(() => isConnecting = true);
-    _gearController.repeat();
-
-    try {
-      final bool permissionGranted = await flutterV2ray.requestPermission();
-
-      if (permissionGranted) {
-        final v2rayURL = FlutterV2ray.parseFromURL(activeNode.rawConfig);
-
-        v2rayURL.dns = {
-          "servers": [
-            "https://dns.google/dns-query",
-            "8.8.8.8",
-            "1.1.1.1",
-            "111.88.96.50",
-            "77.88.8.8"
-          ],
-          "queryStrategy": "UseIP"
-        };
-
-        try {
-          v2rayURL.inbound['sniffing'] = {
-            "enabled": true,
-            "destOverride": ["http", "tls", "quic"],
-            "routeOnly": false
-          };
-        } catch (_) {}
-
-        try {
-          List rules = v2rayURL.routing['rules'] ?? [];
-          rules.insert(0, {
-            "type": "field",
-            "port": "53",
-            "outboundTag": "proxy"
-          });
-          v2rayURL.routing['rules'] = rules;
-          v2rayURL.routing['domainStrategy'] = "IPIfNonMatch";
-        } catch (_) {}
-
-        await flutterV2ray.startV2Ray(
-          remark: activeNode.name,
-          config: v2rayURL.getFullConfiguration(),
-          proxyOnly: false,
-          bypassSubnets: null,
-          notificationDisconnectButtonName: "ОТКЛЮЧИТЬ",
-        );
-
-        _showToast("VPN активирован", isSuccess: true);
-      } else {
-        setState(() => isConnecting = false);
-        _gearController.stop();
-        _showToast("Разрешение отклонено", isSuccess: false);
-      }
-    } catch (e) {
-      setState(() => isConnecting = false);
-      _gearController.stop();
-      _showToast("Ошибка конфигурации узла", isSuccess: false);
-    }
   }
 
   void _showAddKeyDialog() {
@@ -653,7 +715,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               });
 
               _saveCustomKeysToStorage();
-              _testNodePing(newNode);
+              _testNodeRealDelay(newNode);
               Navigator.pop(context);
               _showToast("Ключ сохранен", isSuccess: true);
             },
@@ -691,13 +753,11 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               SizedBox(height: 8),
               Text(
                 "1. Сбор реестров GitHub:\n"
-                "Опрос открытых источников VLESS Reality и Shadowsocks каждые 15 минут.\n\n"
-                "2. Экспресс-замер TCP Handshake:\n"
-                "Мгновенный замер задержки через прямой TCP SYN/ACK сокет. Автоматическая сортировка лучших узлов наверх списка.\n\n"
-                "3. Закрепление узлов:\n"
-                "Возможность зафиксировать надежные ключи вверху реестра с защитой от очистки.\n\n"
-                "4. DNS-туннелирование:\n"
-                "DNS-трафик маршрутизируется внутрь туннеля через DoH каскад для обхода фильтрации.",
+                "Опрос открытых баз VLESS Reality и Shadowsocks каждые 15 минут.\n\n"
+                "2. Честный замер Real Delay:\n"
+                "Опрос узлов через ядро Xray до gstatic.com/generate_204 по стандарту v2rayNG с автоматической сортировкой.\n\n"
+                "3. Чистый DNS и маршрутизация:\n"
+                "Штатная конфигурация DNS 1.1.1.1 и 8.8.8.8 со сниффингом TLS/HTTP без дедлоков видеопотоков YouTube.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
             ],
@@ -860,7 +920,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                       size: 38,
                       color: isConnected
                           ? const Color(0xFFFFB74D)
-                          : (isConnecting ? const Color(0xFFC5A059) : const Color(0xFF6B635B)),
+                          : (_isReconnecting || isConnecting ? const Color(0xFFC5A059) : const Color(0xFF6B635B)),
                     ),
                   ),
                 ],
@@ -872,9 +932,13 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             Text(
               isConnected
                   ? "СОЕДИНЕНИЕ АКТИВНО"
-                  : (isConnecting ? "ПОДКЛЮЧЕНИЕ..." : "ОТКЛЮЧЕНО"),
+                  : (_isReconnecting
+                      ? "ПЕРЕПОДКЛЮЧЕНИЕ..."
+                      : (isConnecting ? "ПОДКЛЮЧЕНИЕ..." : "ОТКЛЮЧЕНО")),
               style: TextStyle(
-                color: isConnected ? const Color(0xFFFFB74D) : const Color(0xFF9E948A),
+                color: isConnected
+                    ? const Color(0xFFFFB74D)
+                    : (_isReconnecting || isConnecting ? const Color(0xFFC5A059) : const Color(0xFF9E948A)),
                 fontSize: 12,
                 fontWeight: FontWeight.bold,
                 letterSpacing: 2,
@@ -962,15 +1026,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                               final item = activeList[idx];
                               final isCurrent = idx == selectedIndex;
                               return GestureDetector(
-                                onTap: () {
-                                  setState(() => selectedIndex = idx);
-                                  if (item.ping == -2) {
-                                    _testNodePing(item);
-                                  }
-                                },
+                                onTap: () => _selectAndSwitchServer(idx),
                                 child: Container(
                                   margin: const EdgeInsets.only(bottom: 6),
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                                   decoration: BoxDecoration(
                                     color: isCurrent ? const Color(0xFF24201C) : const Color(0xFF1A1815),
                                     borderRadius: BorderRadius.circular(8),
@@ -980,41 +1039,44 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                     ),
                                   ),
                                   child: Row(
-                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                     children: [
-                                      Row(
-                                        children: [
-                                          Container(
-                                            width: 8,
-                                            height: 8,
-                                            decoration: BoxDecoration(
-                                              shape: BoxShape.circle,
-                                              color: item.isPinned
-                                                  ? const Color(0xFFFF9800)
-                                                  : (isCurrent ? const Color(0xFFC5A059) : const Color(0xFF5A524A)),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 10),
-                                          if (item.isPinned)
-                                            const Padding(
-                                              padding: EdgeInsets.only(right: 6),
-                                              child: Icon(Icons.push_pin, size: 13, color: Color(0xFFFF9800)),
-                                            ),
-                                          SizedBox(
-                                            width: MediaQuery.of(context).size.width * (item.isPinned ? 0.38 : 0.42),
-                                            child: Text(
-                                              item.name,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                color: isCurrent ? Colors.white : const Color(0xFFD6D3D1),
-                                                fontSize: 12,
-                                                fontWeight: (isCurrent || item.isPinned) ? FontWeight.bold : FontWeight.normal,
+                                      Expanded(
+                                        child: Row(
+                                          children: [
+                                            Container(
+                                              width: 8,
+                                              height: 8,
+                                              decoration: BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                color: item.isPinned
+                                                    ? const Color(0xFFFF9800)
+                                                    : (isCurrent ? const Color(0xFFC5A059) : const Color(0xFF5A524A)),
                                               ),
                                             ),
-                                          ),
-                                        ],
+                                            const SizedBox(width: 8),
+                                            if (item.isPinned)
+                                              const Padding(
+                                                padding: EdgeInsets.only(right: 6),
+                                                child: Icon(Icons.push_pin, size: 13, color: Color(0xFFFF9800)),
+                                              ),
+                                            Expanded(
+                                              child: Text(
+                                                item.name,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  color: isCurrent ? Colors.white : const Color(0xFFD6D3D1),
+                                                  fontSize: 12,
+                                                  fontWeight: (isCurrent || item.isPinned) ? FontWeight.bold : FontWeight.normal,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
                                       ),
+                                      const SizedBox(width: 6),
                                       Row(
+                                        mainAxisSize: MainAxisSize.min,
                                         children: [
                                           _buildPingBadge(item.ping),
                                           const SizedBox(width: 4),
@@ -1024,16 +1086,25 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                               size: 16,
                                               color: item.isPinned ? const Color(0xFFFF9800) : const Color(0xFF8C827A),
                                             ),
+                                            visualDensity: VisualDensity.compact,
+                                            padding: EdgeInsets.zero,
+                                            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
                                             tooltip: item.isPinned ? "Открепить узел" : "Закрепить узел вверху",
                                             onPressed: () => _togglePin(item),
                                           ),
                                           IconButton(
                                             icon: const Icon(Icons.network_check, size: 16, color: Color(0xFFC5A059)),
+                                            visualDensity: VisualDensity.compact,
+                                            padding: EdgeInsets.zero,
+                                            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
                                             tooltip: "Замерить задержку",
-                                            onPressed: () => _testNodePing(item),
+                                            onPressed: () => _testNodeRealDelay(item),
                                           ),
                                           IconButton(
                                             icon: const Icon(Icons.copy, size: 15, color: Color(0xFF8C827A)),
+                                            visualDensity: VisualDensity.compact,
+                                            padding: EdgeInsets.zero,
+                                            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
                                             tooltip: "Скопировать ключ",
                                             onPressed: () {
                                               Clipboard.setData(ClipboardData(text: item.rawConfig));
@@ -1043,6 +1114,9 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                                           if (item.isCustom)
                                             IconButton(
                                               icon: const Icon(Icons.delete_outline, size: 16, color: Color(0xFFC62828)),
+                                              visualDensity: VisualDensity.compact,
+                                              padding: EdgeInsets.zero,
+                                              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
                                               tooltip: "Удалить",
                                               onPressed: () {
                                                 setState(() {
