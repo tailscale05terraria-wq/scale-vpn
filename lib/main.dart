@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -33,7 +32,7 @@ class ScaleVpnApp extends StatelessWidget {
   }
 }
 
-// ПАЛИТРА ИНДУСТРИАЛЬНОГО СТИМПАНКА
+// ПАЛИТРА СТИМПАНК
 class Palette {
   static const Color background = Color(0xFF0F0E0D);
   static const Color panel = Color(0xFF13110F);
@@ -65,7 +64,6 @@ class Palette {
   );
 }
 
-// Прозрачность без устаревшего API withOpacity: собираем цвет по каналам
 Color tint(int r, int g, int b, double fraction) {
   final double f = fraction < 0 ? 0 : (fraction > 1 ? 1 : fraction);
   return Color.fromARGB((f * 255).round(), r, g, b);
@@ -75,19 +73,10 @@ Color amberTint(double fraction) => tint(0xFF, 0x98, 0x00, fraction);
 Color brassTint(double fraction) => tint(0xC5, 0xA0, 0x59, fraction);
 Color whiteTint(double fraction) => tint(0xFF, 0xFF, 0xFF, fraction);
 
-class ServerEndpoint {
-  final String host;
-  final int port;
-  ServerEndpoint(this.host, this.port);
-
-  @override
-  String toString() => '$host:$port';
-}
-
 class ServerNode {
   final String name;
   final String rawConfig;
-  int ping; // -2: замер, -1: таймаут, >0: миллисекунды
+  int ping; // -2: замер, -1: таймаут, >0: мс
   final bool isCustom;
   bool isPinned;
 
@@ -147,58 +136,38 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   bool isConnected = false;
   bool isConnecting = false;
   bool isSearchingGitHub = false;
+  String searchStatusText = "";
 
-  int currentTab = 0; // 0 - GitHub, 1 - Мои ключи
+  int currentTab = 0; // 0 - GitHub, 1 - Свои ключи
   int selectedIndex = 0;
 
   List<ServerNode> autoServers = [];
   List<ServerNode> customServers = [];
   Set<String> pinnedConfigs = {};
 
-  // ЧЕРНЫЙ СПИСОК: ключ эндпоинта -> метка времени внесения (millisSinceEpoch)
   final Map<String, int> _deadKeys = {};
-  static const int _deadKeyTtlMs = 6 * 60 * 60 * 1000; // 6 часов
-  static const int _deadKeyLimit = 900;
+  static const int _deadKeyTtlMs = 3 * 60 * 60 * 1000; // 3 часа
 
-  // РОТАЦИЯ И ПРИОРИТЕТЫ
-  int _priorityOffset = 0;
-  int _generalOffset = 0;
-  static const int _batchSize = 18;
-  static const int _maxAutoRetries = 3;
+  // Параметры выборки: ищем около 10-15 стабильных ключей
+  static const int _targetWorkingNodes = 12;
+  static const int _maxCandidatesToInspect = 36;
+  int _sourceRotationIndex = 0;
 
   final math.Random _random = math.Random();
 
-  // 1. ПРИОРИТЕТНЫЕ РЕПОЗИТОРИИ ДЛЯ РФ (igareck & topics/free-vpn-russia)
-  // Протестированы на обход ТСПУ, белые списки и Reality
-  final List<String> priorityRussiaSources = [
-    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
-    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS.txt',
-    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/Vless-Reality-White-Lists-Rus-Mobile.txt',
-    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_SS+All_RUS.txt',
+  // ПРОВЕРЕННЫЕ ССЫЛКИ IGARECK + НАДЕЖНЫЕ ЗЕРКАЛА ДЛЯ РФ
+  final List<String> vpnSources = [
+    // Прямые ссылки на репозиторий
     'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt',
-    'https://cdn.jsdelivr.net/gh/AvenCores/goida-vpn-configs@main/vless.txt',
-    'https://cdn.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/clean/vless.txt',
-    'https://cdn.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/ru-sni/vless_ru.txt',
-    'https://cdn.jsdelivr.net/gh/hiztin/VLESS-PO-GRIBI@main/vless.txt',
-    'https://cdn.jsdelivr.net/gh/FLAT447/v2ray-lists@main/vless.txt',
+    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt',
+    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt',
+    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS%2BAll_RUS.txt',
+    // Зеркала githack и jsdelivr (работают даже при блокировке raw.githubusercontent.com)
+    'https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt',
+    'https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt',
+    'https://fastly.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
+    'https://fastly.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/clean/vless.txt',
   ];
-
-  // 2. РЕЗЕРВНЫЕ МЕЖДУНАРОДНЫЕ ЗЕРКАЛА (VLESS Reality / Shadowsocks)
-  final List<String> generalSources = [
-    'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/vless.txt',
-    'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/ss.txt',
-    'https://cdn.jsdelivr.net/gh/ebrasha/free-v2ray-public-list@main/vless_configs.txt',
-    'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/vless.txt',
-    'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/shadowsocks.txt',
-    'https://cdn.jsdelivr.net/gh/mahdibland/V2RayAggregator@master/sub/sub_merge.txt',
-    'https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/vless.txt',
-    'https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/ss.txt',
-    'https://cdn.jsdelivr.net/gh/soroushmirzaei/telegram-configs-collector@main/protocols/vless',
-    'https://cdn.jsdelivr.net/gh/soroushmirzaei/telegram-configs-collector@main/protocols/shadowsocks',
-    'https://cdn.jsdelivr.net/gh/MhdiTaheri/V2rayCollector@main/sub/vless',
-  ];
-
-  List<String> get gitHubSources => [...priorityRussiaSources, ...generalSources];
 
   @override
   void initState() {
@@ -219,7 +188,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   Future<void> _bootstrap() async {
     await _loadStoredData();
     if (!mounted) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) => _searchGitHubForKeys());
+    // Если список пуст, запускаем автопоиск
+    if (autoServers.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _searchGitHubForKeys());
+    }
   }
 
   void _initV2RayEngine() async {
@@ -235,28 +207,33 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     super.dispose();
   }
 
-  // ХРАНИЛИЩЕ
+  // ХРАНИЛИЩЕ И МИГРАЦИЯ ЧЕРНОГО СПИСКА
 
   Future<void> _loadStoredData() async {
     try {
       final prefs = await SharedPreferences.getInstance();
 
-      final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
-      pinnedConfigs = pinnedList.toSet();
-
-      _priorityOffset = prefs.getInt('priority_rotation_offset') ?? 0;
-      _generalOffset = prefs.getInt('general_rotation_offset') ?? 0;
-
-      final dead = prefs.getStringList('dead_endpoints') ?? [];
-      final now = DateTime.now().millisecondsSinceEpoch;
-      for (final entry in dead) {
-        final parts = entry.split('|');
-        if (parts.length != 2) continue;
-        final ts = int.tryParse(parts[1]) ?? 0;
-        if (now - ts < _deadKeyTtlMs) {
-          _deadKeys[parts[0]] = ts;
+      // ОЧИСТКА СТАРОГО «ОТРАВЛЕННОГО» ЧЕРНОГО СПИСКА
+      final int blacklistVersion = prefs.getInt('blacklist_version_v3') ?? 0;
+      if (blacklistVersion < 3) {
+        await prefs.remove('dead_endpoints');
+        _deadKeys.clear();
+        await prefs.setInt('blacklist_version_v3', 3);
+      } else {
+        final dead = prefs.getStringList('dead_endpoints') ?? [];
+        final now = DateTime.now().millisecondsSinceEpoch;
+        for (final entry in dead) {
+          final parts = entry.split('|');
+          if (parts.length != 2) continue;
+          final ts = int.tryParse(parts[1]) ?? 0;
+          if (now - ts < _deadKeyTtlMs) {
+            _deadKeys[parts[0]] = ts;
+          }
         }
       }
+
+      final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
+      pinnedConfigs = pinnedList.toSet();
 
       final saved = prefs.getStringList('custom_vpn_keys') ?? [];
       if (saved.isNotEmpty && mounted) {
@@ -293,45 +270,23 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     } catch (_) {}
   }
 
-  Future<void> _saveRotationOffset() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt('priority_rotation_offset', _priorityOffset);
-      await prefs.setInt('general_rotation_offset', _generalOffset);
-      await prefs.setInt('rotation_offset', _priorityOffset);
-    } catch (_) {}
-  }
-
   Future<void> _saveDeadKeys() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final now = DateTime.now().millisecondsSinceEpoch;
-
       _deadKeys.removeWhere((key, ts) => now - ts >= _deadKeyTtlMs);
-
-      if (_deadKeys.length > _deadKeyLimit) {
-        final sorted = _deadKeys.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
-        final trimmed = sorted.take(_deadKeyLimit).toList();
-        _deadKeys
-          ..clear()
-          ..addEntries(trimmed);
-      }
 
       final list = _deadKeys.entries.map((e) => "${e.key}|${e.value}").toList();
       await prefs.setStringList('dead_endpoints', list);
     } catch (_) {}
   }
 
-  // ЧЕРНЫЙ СПИСОК
-
-  String _blacklistKey(String rawConfig) {
-    final ep = _parseEndpoint(rawConfig);
-    if (ep != null) return ep.toString();
+  String _configHash(String rawConfig) {
     return rawConfig.split('#').first.trim();
   }
 
   bool _isBlacklisted(String rawConfig) {
-    final key = _blacklistKey(rawConfig);
+    final key = _configHash(rawConfig);
     final ts = _deadKeys[key];
     if (ts == null) return false;
     if (DateTime.now().millisecondsSinceEpoch - ts >= _deadKeyTtlMs) {
@@ -343,96 +298,30 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
 
   void _markDead(String rawConfig) {
     if (pinnedConfigs.contains(rawConfig)) return;
-    _deadKeys[_blacklistKey(rawConfig)] = DateTime.now().millisecondsSinceEpoch;
+    _deadKeys[_configHash(rawConfig)] = DateTime.now().millisecondsSinceEpoch;
   }
 
   void _markAlive(String rawConfig) {
-    _deadKeys.remove(_blacklistKey(rawConfig));
+    _deadKeys.remove(_configHash(rawConfig));
   }
 
-  // КОНФИГУРАЦИЯ ЯДРА (DNS и сниффинг по эталону v2rayNG)
+  // БЕЗОПАСНАЯ КОНФИГУРАЦИЯ XRAY
 
-  String _buildCleanConfig(String rawConfig) {
-    final v2rayURL = FlutterV2ray.parseFromURL(rawConfig);
-
-    v2rayURL.dns = {
-      "servers": [
-        "1.1.1.1",
-        "8.8.8.8",
-        "1.0.0.1",
-        "8.8.4.4"
-      ],
-      "queryStrategy": "UseIP"
-    };
-
+  String? _buildCleanConfig(String rawConfig) {
     try {
-      v2rayURL.inbound['sniffing'] = {
-        "enabled": true,
-        "destOverride": ["http", "tls"],
-        "routeOnly": false
-      };
-    } catch (_) {}
-
-    final Map<String, dynamic> configMap = jsonDecode(v2rayURL.getFullConfiguration());
-    return jsonEncode(configMap);
-  }
-
-  ServerEndpoint? _parseEndpoint(String rawConfig) {
-    try {
-      final uri = Uri.tryParse(rawConfig);
-      if (uri != null && uri.host.isNotEmpty && uri.port > 0) {
-        return ServerEndpoint(uri.host, uri.port);
-      }
-    } catch (_) {}
-
-    try {
-      final ipv6Reg = RegExp(r'@\[([a-fA-F0-9:]+)\]:(\d+)');
-      final match = ipv6Reg.firstMatch(rawConfig);
-      if (match != null) {
-        return ServerEndpoint(match.group(1)!, int.parse(match.group(2)!));
-      }
-    } catch (_) {}
-
-    try {
-      final reg = RegExp(r'@([a-zA-Z0-9\.\-]+):(\d+)');
-      final match = reg.firstMatch(rawConfig);
-      if (match != null) {
-        return ServerEndpoint(match.group(1)!, int.parse(match.group(2)!));
-      }
-    } catch (_) {}
-
-    if (rawConfig.startsWith('ss://')) {
+      final v2rayURL = FlutterV2ray.parseFromURL(rawConfig);
       try {
-        final body = rawConfig.substring(5).split('#').first;
-        if (body.contains('@')) {
-          final hostPort = body.split('@').last.split(':');
-          return ServerEndpoint(hostPort[0], int.tryParse(hostPort[1]) ?? 443);
-        } else {
-          String b64 = body;
-          while (b64.length % 4 != 0) {
-            b64 += '=';
-          }
-          final decoded = utf8.decode(base64.decode(b64));
-          if (decoded.contains('@')) {
-            final hostPort = decoded.split('@').last.split(':');
-            return ServerEndpoint(hostPort[0], int.tryParse(hostPort[1]) ?? 443);
-          }
+        if (v2rayURL.inbound is Map) {
+          v2rayURL.inbound['sniffing'] = {
+            "enabled": true,
+            "destOverride": ["http", "tls"],
+            "routeOnly": false
+          };
         }
       } catch (_) {}
-    }
-
-    return null;
-  }
-
-  Future<bool> _fastTcpPreCheck(String rawConfig) async {
-    final ep = _parseEndpoint(rawConfig);
-    if (ep == null) return false;
-    try {
-      final socket = await Socket.connect(ep.host, ep.port, timeout: const Duration(milliseconds: 900));
-      socket.destroy();
-      return true;
+      return v2rayURL.getFullConfiguration();
     } catch (_) {
-      return false;
+      return null;
     }
   }
 
@@ -483,244 +372,198 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     List<String> results = [];
     String text = rawData;
 
+    // Проверка Base64 (если ссылка является подпиской)
     try {
       String cleaned = rawData.replaceAll(RegExp(r'\s+'), '');
-      while (cleaned.length % 4 != 0) {
-        cleaned += '=';
-      }
-      final decoded = utf8.decode(base64.decode(cleaned));
-      if (decoded.contains('vless://') || decoded.contains('ss://')) {
-        text = decoded;
+      if (cleaned.length % 4 == 0 && !cleaned.contains('://')) {
+        final decoded = utf8.decode(base64.decode(cleaned));
+        if (decoded.contains('://')) {
+          text = decoded;
+        }
       }
     } catch (_) {}
 
     final lines = text.split(RegExp(r'[\r\n]+'));
     for (var line in lines) {
       line = line.trim();
-      if (line.startsWith('vless://') || line.startsWith('ss://')) {
+      // Строго принимаем только протоколы, поддерживаемые ядром flutter_v2ray
+      // (исключаем hysteria2://, tuic://, которые вызывают сбой)
+      if (line.startsWith('vless://') ||
+          line.startsWith('ss://') ||
+          line.startsWith('vmess://') ||
+          line.startsWith('trojan://')) {
         results.add(line);
       }
     }
     return results;
   }
 
-  // СБОР УЗЛОВ: ПРЕОБЛАДАЮЩИЙ ОПРОС igareck И topics/free-vpn-russia С РЕЗЕРВОМ
+  // ПОИСК И АВТОМАТИЧЕСКАЯ КАЛИБРОВКА 10-15 РАБОЧИХ КЛЮЧЕЙ
 
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
-    setState(() => isSearchingGitHub = true);
+    setState(() {
+      isSearchingGitHub = true;
+      searchStatusText = "Загрузка реестров РФ...";
+    });
 
-    _showToast("Синхронизация узлов: опрос реестров РФ и зеркал", isSuccess: true);
+    _showToast("Опрос проверенных реестров igareck", isSuccess: true);
 
     try {
-      await _runDiscoveryCycle(attempt: 0);
+      await _runSmartDiscovery();
     } catch (_) {
-      if (mounted) _showToast("Ошибка связи с реестрами GitHub", isSuccess: false);
+      if (mounted) _showToast("Сбой при опросе источников", isSuccess: false);
     } finally {
       await _saveDeadKeys();
-      await _saveRotationOffset();
-      if (mounted) setState(() => isSearchingGitHub = false);
+      if (mounted) {
+        setState(() {
+          isSearchingGitHub = false;
+          searchStatusText = "";
+        });
+      }
     }
   }
 
-  Future<Map<String, List<String>>> _fetchPool() async {
-    // 1. Формируем пачку приоритетных источников (РФ / igareck / topics/free-vpn-russia)
-    final priorityBatch = <String>[];
-    final pTotal = priorityRussiaSources.length;
-    for (int i = 0; i < 4; i++) {
-      priorityBatch.add(priorityRussiaSources[(_priorityOffset + i) % pTotal]);
-    }
-
-    // 2. Формируем пачку общих международных зеркал для разнообразия и отказоустойчивости
-    final generalBatch = <String>[];
-    final gTotal = generalSources.length;
+  Future<void> _runSmartDiscovery() async {
+    // 1. Скачиваем 2-3 источника со сдвигом ротации
+    final activeBatch = <String>[];
+    final totalSources = vpnSources.length;
     for (int i = 0; i < 3; i++) {
-      generalBatch.add(generalSources[(_generalOffset + i) % gTotal]);
+      activeBatch.add(vpnSources[(_sourceRotationIndex + i) % totalSources]);
     }
+    _sourceRotationIndex = (_sourceRotationIndex + 2) % totalSources;
 
-    final priorityFutures = priorityBatch.map((url) async {
+    final pool = <String>{};
+
+    for (final url in activeBatch) {
       try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 7));
         if (res.statusCode == 200 && res.body.isNotEmpty) {
-          return _extractConfigs(res.body);
+          final extracted = _extractConfigs(res.body);
+          pool.addAll(extracted);
         }
       } catch (_) {}
-      return <String>[];
-    });
+    }
 
-    final generalFutures = generalBatch.map((url) async {
+    if (pool.isEmpty) {
+      // Резервная попытка через прямой jsdelivr
       try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
-        if (res.statusCode == 200 && res.body.isNotEmpty) {
-          return _extractConfigs(res.body);
+        final res = await http.get(Uri.parse(
+          'https://fastly.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
+        )).timeout(const Duration(seconds: 7));
+        if (res.statusCode == 200) {
+          pool.addAll(_extractConfigs(res.body));
         }
       } catch (_) {}
-      return <String>[];
-    });
-
-    final priorityResults = await Future.wait(priorityFutures);
-    final generalResults = await Future.wait(generalFutures);
-
-    final priorityPool = <String>[];
-    final seenPriority = <String>{};
-    for (final list in priorityResults) {
-      for (final cfg in list) {
-        if (seenPriority.add(cfg)) priorityPool.add(cfg);
-      }
     }
 
-    final generalPool = <String>[];
-    final seenGeneral = <String>{};
-    for (final list in generalResults) {
-      for (final cfg in list) {
-        if (!seenPriority.contains(cfg) && seenGeneral.add(cfg)) {
-          generalPool.add(cfg);
-        }
-      }
-    }
-
-    return {
-      'priority': priorityPool,
-      'general': generalPool,
-    };
-  }
-
-  Future<void> _runDiscoveryCycle({required int attempt}) async {
-    final pools = await _fetchPool();
-    final priorityList = pools['priority'] ?? [];
-    final generalList = pools['general'] ?? [];
-
-    if (priorityList.isEmpty && generalList.isEmpty) {
-      if (attempt < _maxAutoRetries) {
-        _priorityOffset = (_priorityOffset + 3) % priorityRussiaSources.length;
-        _generalOffset = (_generalOffset + 3) % generalSources.length;
-        if (mounted) _showToast("Поиск альтернативных узлов...", isSuccess: true);
-        await Future.delayed(const Duration(milliseconds: 400));
-        return _runDiscoveryCycle(attempt: attempt + 1);
-      }
-      if (mounted) _showToast("Реестры GitHub недоступны", isSuccess: false);
+    if (pool.isEmpty) {
+      if (mounted) _showToast("Не удалось загрузить списки ключей", isSuccess: false);
       return;
     }
 
-    // Отсекаем черный список
-    final cleanPriority = priorityList.where((c) => !_isBlacklisted(c)).toList();
-    final cleanGeneral = generalList.where((c) => !_isBlacklisted(c)).toList();
+    // 2. Отсеиваем черный список и перемешиваем для получения свежих узлов
+    List<String> candidates = pool.where((c) => !_isBlacklisted(c)).toList();
+    if (candidates.length < 15) {
+      candidates = pool.toList(); // Если пул мал, даем второй шанс
+    }
+    candidates.shuffle(_random);
 
-    final workingPriority = cleanPriority.isNotEmpty ? cleanPriority : priorityList;
-    final workingGeneral = cleanGeneral.isNotEmpty ? cleanGeneral : generalList;
+    // Берем пачку для последовательной проверки (до 36 кандидатов)
+    final toTest = candidates.take(_maxCandidatesToInspect).toList();
 
-    // Перемешивание: каждый поиск выдает свежую выборку, а не первые строки файла
-    workingPriority.shuffle(_random);
-    workingGeneral.shuffle(_random);
+    // Сохраняем закрепленные пользователем узлы
+    final List<ServerNode> workingNodes = autoServers.where((s) => s.isPinned).toList();
 
-    final collectedNodes = <ServerNode>[];
-    collectedNodes.addAll(autoServers.where((s) => s.isPinned));
-
-    // Преобладающая квота для качественных РФ реестров (70% выборки: ~13 узлов)
-    const int priorityQuota = 13;
-    final priorityPick = workingPriority.take(priorityQuota).toList();
-
-    // Дополняем резервными зеркалами до размера пакета _batchSize (18 узлов)
-    final remainingCount = _batchSize - collectedNodes.length - priorityPick.length;
-    final generalPick = workingGeneral.take(math.max(0, remainingCount)).toList();
-
-    // Балансировка: если одного пула не хватило, добираем из второго
-    final combinedConfigs = <String>[...priorityPick, ...generalPick];
-    if (combinedConfigs.length < (_batchSize - collectedNodes.length)) {
-      for (final c in workingPriority) {
-        if (combinedConfigs.length >= (_batchSize - collectedNodes.length)) break;
-        if (!combinedConfigs.contains(c)) combinedConfigs.add(c);
-      }
-      for (final c in workingGeneral) {
-        if (combinedConfigs.length >= (_batchSize - collectedNodes.length)) break;
-        if (!combinedConfigs.contains(c)) combinedConfigs.add(c);
-      }
+    if (mounted) {
+      setState(() {
+        searchStatusText = "Проверка задержки узлов...";
+        autoServers = List.from(workingNodes);
+      });
     }
 
-    for (final config in combinedConfigs) {
-      if (collectedNodes.length >= _batchSize) break;
-      if (collectedNodes.any((n) => n.rawConfig == config)) continue;
+    int testedCount = 0;
 
-      String title = "Узел ${collectedNodes.length + 1}";
-      if (config.contains('#')) {
-        try {
-          title = Uri.decodeComponent(config.split('#').last).trim();
-        } catch (_) {
-          title = config.split('#').last;
-        }
+    // 3. ПОСЛЕДОВАТЕЛЬНЫЙ ЗАМЕР ЧЕРЕЗ XRAY (защита от конфликта портов)
+    for (final config in toTest) {
+      if (!mounted) break;
+      if (workingNodes.length >= _targetWorkingNodes) {
+        // Набрали 10-15 рабочих ключей — МГНОВЕННЫЙ СТОП
+        break;
       }
-      if (title.isEmpty) title = "Узел ${collectedNodes.length + 1}";
-      if (title.length > 42) title = title.substring(0, 42);
 
-      collectedNodes.add(ServerNode(
-        name: title,
-        rawConfig: config,
-        ping: -2,
-        isPinned: pinnedConfigs.contains(config),
-      ));
+      testedCount++;
+      setState(() {
+        searchStatusText = "Найдено рабочих: ${workingNodes.length}/$_targetWorkingNodes (шаг $testedCount)";
+      });
+
+      final int delay = await _testRealDelayInternal(config);
+
+      if (delay > 0) {
+        _markAlive(config);
+
+        String title = "Узел ${workingNodes.length + 1}";
+        if (config.contains('#')) {
+          try {
+            title = Uri.decodeComponent(config.split('#').last).trim();
+          } catch (_) {
+            title = config.split('#').last.trim();
+          }
+        }
+        if (title.isEmpty) title = "Узел ${workingNodes.length + 1}";
+        if (title.length > 40) title = title.substring(0, 40);
+
+        final newNode = ServerNode(
+          name: title,
+          rawConfig: config,
+          ping: delay,
+          isPinned: pinnedConfigs.contains(config),
+        );
+
+        workingNodes.add(newNode);
+        _sortNodes(workingNodes);
+
+        if (mounted) {
+          setState(() {
+            autoServers = List.from(workingNodes);
+            if (selectedIndex >= autoServers.length) selectedIndex = 0;
+          });
+        }
+      } else {
+        _markDead(config);
+      }
     }
 
     if (!mounted) return;
 
     setState(() {
-      autoServers = collectedNodes;
+      autoServers = workingNodes;
       _sortNodes(autoServers);
       selectedIndex = 0;
     });
 
-    _showToast("Получено узлов: ${collectedNodes.length}. Замер задержки", isSuccess: true);
-
-    await _testNodesPipeline(autoServers);
-
-    if (!mounted) return;
-
-    setState(() {
-      for (final node in autoServers) {
-        if (!node.isPinned && node.ping <= 0 && node.ping != -2) {
-          _markDead(node.rawConfig);
-        }
-      }
-      autoServers.removeWhere((s) => !s.isPinned && s.ping <= 0);
-      _sortNodes(autoServers);
-      if (selectedIndex >= autoServers.length) selectedIndex = 0;
-    });
-
-    // ЗАЩИТНЫЙ АЛГОРИТМ: пустой список автоматически запускает поиск по следующим смещениям
-    if (autoServers.isEmpty && attempt < _maxAutoRetries) {
-      _priorityOffset = (_priorityOffset + 2) % priorityRussiaSources.length;
-      _generalOffset = (_generalOffset + 2) % generalSources.length;
-      _showToast("Поиск альтернативных узлов...", isSuccess: true);
-      await Future.delayed(const Duration(milliseconds: 300));
-      return _runDiscoveryCycle(attempt: attempt + 1);
-    }
-
     if (autoServers.isEmpty) {
-      _showToast("Стабильных узлов не найдено. Повторите синхронизацию", isSuccess: false);
+      _showToast("Активных узлов не найдено. Нажмите еще раз для другой пачки", isSuccess: false);
     } else {
-      _priorityOffset = (_priorityOffset + 2) % priorityRussiaSources.length;
-      _generalOffset = (_generalOffset + 1) % generalSources.length;
-      _showToast("Проверка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
+      _showToast("Готово! Отобрано рабочих узлов: ${autoServers.length}", isSuccess: true);
     }
   }
 
-  Future<void> _testNodesPipeline(List<ServerNode> nodes) async {
-    List<ServerNode> candidates = [];
+  // ЗАМЕР ЧЕРЕЗ XRAY (реальный запрос до Google 204)
+  Future<int> _testRealDelayInternal(String rawConfig) async {
+    final cleanConfig = _buildCleanConfig(rawConfig);
+    if (cleanConfig == null) return -1;
 
-    await Future.wait(nodes.map((node) async {
-      final reachable = await _fastTcpPreCheck(node.rawConfig);
-      if (reachable) {
-        candidates.add(node);
-      } else {
-        if (mounted) setState(() => node.ping = -1);
-      }
-    }));
-
-    const int chunkSize = 2;
-    for (int i = 0; i < candidates.length; i += chunkSize) {
-      if (!mounted) break;
-      final end = (i + chunkSize < candidates.length) ? i + chunkSize : candidates.length;
-      final chunk = candidates.sublist(i, end);
-      await Future.wait(chunk.map((node) => _testNodeRealDelay(node)));
+    try {
+      final delay = await flutterV2ray
+          .getServerDelay(
+            config: cleanConfig,
+            url: 'https://www.gstatic.com/generate_204',
+          )
+          .timeout(const Duration(milliseconds: 3600), onTimeout: () => -1);
+      return delay;
+    } catch (_) {
+      return -1;
     }
   }
 
@@ -739,15 +582,17 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
       if (isCurrentlyConnectedNode) {
         delay = await flutterV2ray
             .getConnectedServerDelay(url: 'https://www.gstatic.com/generate_204')
-            .timeout(const Duration(milliseconds: 2500), onTimeout: () => -1);
+            .timeout(const Duration(milliseconds: 3600), onTimeout: () => -1);
       } else {
         final cleanConfig = _buildCleanConfig(node.rawConfig);
-        delay = await flutterV2ray
-            .getServerDelay(
-              config: cleanConfig,
-              url: 'https://www.gstatic.com/generate_204',
-            )
-            .timeout(const Duration(milliseconds: 2500), onTimeout: () => -1);
+        if (cleanConfig != null) {
+          delay = await flutterV2ray
+              .getServerDelay(
+                config: cleanConfig,
+                url: 'https://www.gstatic.com/generate_204',
+              )
+              .timeout(const Duration(milliseconds: 3600), onTimeout: () => -1);
+        }
       }
     } catch (_) {
       delay = -1;
@@ -767,7 +612,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     }
   }
 
-  // УПРАВЛЕНИЕ ТУННЕЛЕМ
+  // УПРАВЛЕНИЕ ПОДКЛЮЧЕНИЕМ
 
   Future<void> _selectAndSwitchServer(int idx) async {
     final activeList = currentTab == 0 ? autoServers : customServers;
@@ -786,7 +631,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
 
       try {
         await flutterV2ray.stopV2Ray();
-        await Future.delayed(const Duration(milliseconds: 180));
+        await Future.delayed(const Duration(milliseconds: 200));
         if (mounted) setState(() => _isReconnecting = false);
         await _startTunnel(targetNode);
       } catch (_) {
@@ -796,7 +641,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
             isConnected = false;
           });
           _gearController.stop();
-          _showToast("Ошибка переподключения", isSuccess: false);
+          _showToast("Ошибка при переподключении", isSuccess: false);
         }
       } finally {
         if (mounted) setState(() => _isReconnecting = false);
@@ -822,6 +667,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
       if (permissionGranted) {
         final cleanConfig = _buildCleanConfig(node.rawConfig);
 
+        if (cleanConfig == null) {
+          throw Exception("Неверный формат конфигурации");
+        }
+
         await flutterV2ray.startV2Ray(
           remark: node.name,
           config: cleanConfig,
@@ -831,20 +680,20 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
         );
 
         if (mounted) {
-          _showToast("Соединение активно: ${node.name}", isSuccess: true);
+          _showToast("Подключено: ${node.name}", isSuccess: true);
         }
       } else {
         if (mounted) {
           setState(() => isConnecting = false);
           _gearController.stop();
-          _showToast("Разрешение отклонено", isSuccess: false);
+          _showToast("Требуется системное разрешение VPN", isSuccess: false);
         }
       }
     } catch (_) {
       if (mounted) {
         setState(() => isConnecting = false);
         _gearController.stop();
-        _showToast("Ошибка конфигурации узла", isSuccess: false);
+        _showToast("Ошибка запуска ядра Xray", isSuccess: false);
       }
     }
   }
@@ -852,7 +701,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   void _handleToggle() async {
     final activeList = currentTab == 0 ? autoServers : customServers;
     if (activeList.isEmpty) {
-      _showToast("Список узлов пуст. Запустите синхронизацию", isSuccess: false);
+      _showToast("Список пуст. Выполняется поиск узлов...", isSuccess: false);
       if (currentTab == 0 && !isSearchingGitHub) _searchGitHubForKeys();
       return;
     }
@@ -870,7 +719,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
         await flutterV2ray.stopV2Ray();
       } catch (_) {}
 
-      _showToast("Соединение разорвано", isSuccess: false);
+      _showToast("VPN отключен", isSuccess: false);
       return;
     }
 
@@ -901,9 +750,9 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     }
 
     if (removedCount > 0) {
-      _showToast("Удалено нерабочих узлов: $removedCount", isSuccess: true);
+      _showToast("Удалено узлов: $removedCount", isSuccess: true);
     } else {
-      _showToast("Все узлы в списке активны", isSuccess: true);
+      _showToast("Все узлы активны", isSuccess: true);
     }
 
     if (currentTab == 0 && autoServers.isEmpty && !isSearchingGitHub) {
@@ -935,7 +784,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
         backgroundColor: isSuccess ? const Color(0xFF1E4620) : const Color(0xFF4A1C1C),
         behavior: SnackBarBehavior.floating,
         elevation: 0,
-        duration: const Duration(milliseconds: 2400),
+        duration: const Duration(milliseconds: 2200),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(10),
           side: BorderSide(
@@ -1074,7 +923,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
           children: const [
             Icon(Icons.info_outline, color: Palette.brass),
             SizedBox(width: 10),
-            Text("Архитектура системы",
+            Text("О системе Scale VPN",
                 style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
           ],
         ),
@@ -1083,25 +932,25 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                "Принципы работы Scale VPN:",
+                "Принципы автоматического подбора:",
                 style: TextStyle(color: Palette.brass, fontWeight: FontWeight.bold, fontSize: 13),
               ),
               const SizedBox(height: 8),
               const Text(
-                "1. Сбор реестров GitHub:\n"
-                "Преобладающий опрос проверенных российских реестров (igareck & topics/free-vpn-russia) с автоматической ротацией и резервными зеркалами.\n\n"
-                "2. Черный список:\n"
-                "Эндпоинты с подтвержденным таймаутом отсекаются до замера и хранятся 6 часов.\n\n"
-                "3. Честный замер Real Delay:\n"
-                "Опрос узлов через ядро Xray до gstatic.com/generate_204 по стандарту v2rayNG с автоматической сортировкой.\n\n"
-                "4. Чистый DNS и маршрутизация:\n"
-                "Штатная конфигурация DNS 1.1.1.1 и 8.8.8.8 со сниффингом TLS/HTTP без дедлоков видеопотоков YouTube.",
+                "• База igareck для РФ:\n"
+                "Приложение подключается к репозиториям с конфигурациями VLESS Reality, адаптированными под обход ТСПУ.\n\n"
+                "• Умный лимит (10-15 узлов):\n"
+                "Вместо загрузки всех 500+ ключей система последовательно проверяет кандидатов до набора 12 гарантированно рабочих узлов.\n\n"
+                "• Честный Real Delay:\n"
+                "Замер производится напрямую встроенным ядром Xray без сторонних эмуляций.\n\n"
+                "• Без дедлоков:\n"
+                "Замер каждого узла изолирован от сетевых конфликтов Android-стека.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
               ),
               const SizedBox(height: 10),
               Text(
-                "Записей в черном списке: ${_deadKeys.length}\nПриоритет (РФ): смещение $_priorityOffset\nРезерв: смещение $_generalOffset",
-                style: const TextStyle(color: Palette.textMuted, fontSize: 11.5, height: 1.4),
+                "Временный фильтр: ${_deadKeys.length} узлов",
+                style: const TextStyle(color: Palette.textMuted, fontSize: 11.5),
               ),
             ],
           ),
@@ -1117,7 +966,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     );
   }
 
-  // ВИЗУАЛЬНЫЕ ЭЛЕМЕНТЫ
+  // ГРАФИЧЕСКИЕ КОМПОНЕНТЫ
 
   Color _pingColor(int ping) {
     if (ping <= 0) return Palette.danger;
@@ -1285,9 +1134,9 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
               _buildHeader(),
               const Spacer(),
               _buildPowerControl(),
-              const SizedBox(height: 22),
+              const SizedBox(height: 18),
               _buildStatusLabel(),
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
               _buildGauge(activeNode),
               const Spacer(),
               _buildServerPanel(activeList),
@@ -1336,7 +1185,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
                   ),
                   const SizedBox(height: 1),
                   const Text(
-                    "GITHUB KEY ENGINE",
+                    "REALITY FOR RUSSIA",
                     style: TextStyle(color: Palette.textMuted, fontSize: 9, letterSpacing: 1.2),
                   ),
                 ],
@@ -1351,7 +1200,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
                 onPressed: _purgeDeadNodes,
               ),
               _buildBrassIconButton(
-                icon: Icons.help_outline,
+                icon: Icons.info_outline,
                 tooltip: "О системе",
                 onPressed: _showInfoDialog,
               ),
@@ -1450,21 +1299,28 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   Widget _buildStatusLabel() {
     final String label = isConnected
         ? "СОЕДИНЕНИЕ АКТИВНО"
-        : (_isReconnecting ? "ПЕРЕПОДКЛЮЧЕНИЕ..." : (isConnecting ? "ПОДКЛЮЧЕНИЕ..." : "ОТКЛЮЧЕНО"));
+        : (_isReconnecting
+            ? "ПЕРЕПОДКЛЮЧЕНИЕ..."
+            : (isConnecting
+                ? "ПОДКЛЮЧЕНИЕ..."
+                : (isSearchingGitHub ? searchStatusText : "ОТКЛЮЧЕНО")));
 
     final Color color = isConnected
         ? Palette.amberSoft
-        : (_isReconnecting || isConnecting ? Palette.brass : const Color(0xFF9E948A));
+        : (_isReconnecting || isConnecting || isSearchingGitHub
+            ? Palette.brass
+            : const Color(0xFF9E948A));
 
     return Column(
       children: [
         Text(
           label,
+          textAlign: TextAlign.center,
           style: TextStyle(
             color: color,
-            fontSize: 12.5,
+            fontSize: 12.0,
             fontWeight: FontWeight.bold,
-            letterSpacing: 2.6,
+            letterSpacing: 2.0,
           ),
         ),
         const SizedBox(height: 6),
@@ -1487,7 +1343,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
 
   Widget _buildServerPanel(List<ServerNode> activeList) {
     return Container(
-      height: 252,
+      height: 256,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
       decoration: const BoxDecoration(
         gradient: LinearGradient(
@@ -1506,7 +1362,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
             children: [
               Row(
                 children: [
-                  _buildTabButton("GitHub Реестр", 0),
+                  _buildTabButton("Узлы РФ (Авто)", 0),
                   const SizedBox(width: 8),
                   _buildTabButton("Свои ключи", 1),
                 ],
@@ -1543,18 +1399,18 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
 
   Widget _buildEmptyState() {
     if (isSearchingGitHub) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            SizedBox(
+            const SizedBox(
               width: 26,
               height: 26,
               child: CircularProgressIndicator(color: Palette.brass, strokeWidth: 2.2),
             ),
-            SizedBox(height: 12),
-            Text("Синхронизация узлов",
-                style: TextStyle(color: Palette.textMuted, fontSize: 11.5, letterSpacing: 1)),
+            const SizedBox(height: 12),
+            Text(searchStatusText,
+                style: const TextStyle(color: Palette.textMuted, fontSize: 11.5, letterSpacing: 0.5)),
           ],
         ),
       );
@@ -1574,7 +1430,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     return Center(
       child: TextButton.icon(
         icon: const Icon(Icons.travel_explore, color: Palette.brass, size: 16),
-        label: const Text("Найти рабочие узлы в реестрах GitHub",
+        label: const Text("Найти рабочие узлы в реестрах",
             style: TextStyle(color: Palette.brass, fontSize: 12)),
         onPressed: _searchGitHubForKeys,
       ),
@@ -1766,7 +1622,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   }
 }
 
-// НЕПОДВИЖНОЕ ВНЕШНЕЕ КОЛЬЦО-БЕЗЕЛЬ С НАСЕЧКОЙ
+// БЕЗЕЛЬ
 class BezelPainter extends CustomPainter {
   final bool isActive;
 
@@ -1808,7 +1664,7 @@ class BezelPainter extends CustomPainter {
   bool shouldRepaint(covariant BezelPainter oldDelegate) => oldDelegate.isActive != isActive;
 }
 
-// ШЛИФОВАННАЯ ЛАТУННАЯ ШЕСТЕРНЯ
+// ЛАТУННАЯ ШЕСТЕРНЯ
 class PolishedGearPainter extends CustomPainter {
   final bool isActive;
 
@@ -1858,7 +1714,6 @@ class PolishedGearPainter extends CustomPainter {
     }
     path.close();
 
-    // Тень под корпусом шестерни
     canvas.drawPath(
       path.shift(const Offset(0, 3)),
       Paint()
@@ -1869,7 +1724,6 @@ class PolishedGearPainter extends CustomPainter {
     canvas.drawPath(path, gearPaint);
     canvas.drawPath(path, edgePaint);
 
-    // Верхний блик шлифовки
     final glossPaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topLeft,
@@ -1882,7 +1736,6 @@ class PolishedGearPainter extends CustomPainter {
       ).createShader(rect);
     canvas.drawPath(path, glossPaint);
 
-    // Внутренняя проточка
     final grooveR = innerR - 9;
     canvas.drawCircle(
       center,
@@ -1893,7 +1746,6 @@ class PolishedGearPainter extends CustomPainter {
         ..color = const Color(0xFF1A1713),
     );
 
-    // Ступица
     final hubR = innerR - 17;
     canvas.drawCircle(
       center,
@@ -1915,7 +1767,6 @@ class PolishedGearPainter extends CustomPainter {
         ..color = isActive ? const Color(0xFF6E5626) : const Color(0xFF2C2723),
     );
 
-    // Заклепки
     final rivetBase = Paint()..color = isActive ? const Color(0xFF7A5F2A) : const Color(0xFF2E2A26);
     final rivetHighlight = Paint()..color = isActive ? const Color(0xFFE2C485) : const Color(0xFF4A443E);
     for (int i = 0; i < teeth; i++) {
