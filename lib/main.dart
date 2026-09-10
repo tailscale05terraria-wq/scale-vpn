@@ -33,10 +33,55 @@ class ScaleVpnApp extends StatelessWidget {
   }
 }
 
+// ПАЛИТРА ИНДУСТРИАЛЬНОГО СТИМПАНКА
+class Palette {
+  static const Color background = Color(0xFF0F0E0D);
+  static const Color panel = Color(0xFF13110F);
+  static const Color metal = Color(0xFF1A1816);
+  static const Color metalEdge = Color(0xFF2E2924);
+  static const Color brass = Color(0xFFC5A059);
+  static const Color brassLight = Color(0xFFE2C485);
+  static const Color brassDark = Color(0xFF8A6B2D);
+  static const Color amber = Color(0xFFFF9800);
+  static const Color amberSoft = Color(0xFFFFB74D);
+  static const Color textPrimary = Color(0xFFE8E4DF);
+  static const Color textMuted = Color(0xFF8C827A);
+  static const Color danger = Color(0xFFE53935);
+  static const Color good = Color(0xFF66BB6A);
+  static const Color average = Color(0xFFFFC107);
+
+  static const LinearGradient brassGradient = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [Color(0xFFE2C485), Color(0xFFC5A059), Color(0xFF8A6B2D)],
+    stops: [0.0, 0.52, 1.0],
+  );
+
+  static const LinearGradient steelGradient = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [Color(0xFF57504A), Color(0xFF413B36), Color(0xFF2A2622)],
+    stops: [0.0, 0.52, 1.0],
+  );
+}
+
+// Прозрачность без устаревшего API withOpacity: собираем цвет по каналам
+Color tint(int r, int g, int b, double fraction) {
+  final double f = fraction < 0 ? 0 : (fraction > 1 ? 1 : fraction);
+  return Color.fromARGB((f * 255).round(), r, g, b);
+}
+
+Color amberTint(double fraction) => tint(0xFF, 0x98, 0x00, fraction);
+Color brassTint(double fraction) => tint(0xC5, 0xA0, 0x59, fraction);
+Color whiteTint(double fraction) => tint(0xFF, 0xFF, 0xFF, fraction);
+
 class ServerEndpoint {
   final String host;
   final int port;
   ServerEndpoint(this.host, this.port);
+
+  @override
+  String toString() => '$host:$port';
 }
 
 class ServerNode {
@@ -62,9 +107,10 @@ class MainVpnScreen extends StatefulWidget {
   State<MainVpnScreen> createState() => _MainVpnScreenState();
 }
 
-class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProviderStateMixin {
+class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateMixin {
   late AnimationController _gearController;
-  
+  late AnimationController _glowController;
+
   bool _isManuallyStopped = false;
   bool _isReconnecting = false;
 
@@ -101,7 +147,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   bool isConnected = false;
   bool isConnecting = false;
   bool isSearchingGitHub = false;
-  
+
   int currentTab = 0; // 0 - GitHub, 1 - Мои ключи
   int selectedIndex = 0;
 
@@ -109,11 +155,32 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   List<ServerNode> customServers = [];
   Set<String> pinnedConfigs = {};
 
+  // ЧЕРНЫЙ СПИСОК: ключ эндпоинта -> метка времени внесения (millisSinceEpoch)
+  final Map<String, int> _deadKeys = {};
+  static const int _deadKeyTtlMs = 6 * 60 * 60 * 1000; // 6 часов
+  static const int _deadKeyLimit = 900;
+
+  // РОТАЦИЯ: смещение по пулу источников, сохраняется между запусками
+  int _rotationOffset = 0;
+  static const int _batchSize = 18;
+  static const int _maxAutoRetries = 3;
+
+  final math.Random _random = math.Random();
+
+  // РАСШИРЕННАЯ БАЗА ОТКРЫТЫХ ЗЕРКАЛ (VLESS Reality / Shadowsocks)
   final List<String> gitHubSources = [
     'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/vless.txt',
+    'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/ss.txt',
     'https://cdn.jsdelivr.net/gh/ebrasha/free-v2ray-public-list@main/vless_configs.txt',
     'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/vless.txt',
+    'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/shadowsocks.txt',
     'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
+    'https://cdn.jsdelivr.net/gh/mahdibland/V2RayAggregator@master/sub/sub_merge.txt',
+    'https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/vless.txt',
+    'https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/ss.txt',
+    'https://cdn.jsdelivr.net/gh/soroushmirzaei/telegram-configs-collector@main/protocols/vless',
+    'https://cdn.jsdelivr.net/gh/soroushmirzaei/telegram-configs-collector@main/protocols/shadowsocks',
+    'https://cdn.jsdelivr.net/gh/MhdiTaheri/V2rayCollector@main/sub/vless',
   ];
 
   @override
@@ -123,8 +190,18 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       vsync: this,
       duration: const Duration(seconds: 4),
     );
+    _glowController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    )..repeat(reverse: true);
+
     _initV2RayEngine();
-    _loadStoredData();
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    await _loadStoredData();
+    if (!mounted) return;
     WidgetsBinding.instance.addPostFrameCallback((_) => _searchGitHubForKeys());
   }
 
@@ -137,18 +214,34 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   @override
   void dispose() {
     _gearController.dispose();
+    _glowController.dispose();
     super.dispose();
   }
+
+  // ХРАНИЛИЩЕ
 
   Future<void> _loadStoredData() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      
+
       final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
       pinnedConfigs = pinnedList.toSet();
 
+      _rotationOffset = prefs.getInt('rotation_offset') ?? 0;
+
+      final dead = prefs.getStringList('dead_endpoints') ?? [];
+      final now = DateTime.now().millisecondsSinceEpoch;
+      for (final entry in dead) {
+        final parts = entry.split('|');
+        if (parts.length != 2) continue;
+        final ts = int.tryParse(parts[1]) ?? 0;
+        if (now - ts < _deadKeyTtlMs) {
+          _deadKeys[parts[0]] = ts;
+        }
+      }
+
       final saved = prefs.getStringList('custom_vpn_keys') ?? [];
-      if (saved.isNotEmpty) {
+      if (saved.isNotEmpty && mounted) {
         setState(() {
           customServers = saved.map((str) {
             final parts = str.split('::');
@@ -182,11 +275,66 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } catch (_) {}
   }
 
-  // Генератор валидной конфигурации по стандарту v2rayNG
+  Future<void> _saveRotationOffset() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('rotation_offset', _rotationOffset);
+    } catch (_) {}
+  }
+
+  Future<void> _saveDeadKeys() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      _deadKeys.removeWhere((key, ts) => now - ts >= _deadKeyTtlMs);
+
+      if (_deadKeys.length > _deadKeyLimit) {
+        final sorted = _deadKeys.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+        final trimmed = sorted.take(_deadKeyLimit).toList();
+        _deadKeys
+          ..clear()
+          ..addEntries(trimmed);
+      }
+
+      final list = _deadKeys.entries.map((e) => "${e.key}|${e.value}").toList();
+      await prefs.setStringList('dead_endpoints', list);
+    } catch (_) {}
+  }
+
+  // ЧЕРНЫЙ СПИСОК
+
+  String _blacklistKey(String rawConfig) {
+    final ep = _parseEndpoint(rawConfig);
+    if (ep != null) return ep.toString();
+    return rawConfig.split('#').first.trim();
+  }
+
+  bool _isBlacklisted(String rawConfig) {
+    final key = _blacklistKey(rawConfig);
+    final ts = _deadKeys[key];
+    if (ts == null) return false;
+    if (DateTime.now().millisecondsSinceEpoch - ts >= _deadKeyTtlMs) {
+      _deadKeys.remove(key);
+      return false;
+    }
+    return true;
+  }
+
+  void _markDead(String rawConfig) {
+    if (pinnedConfigs.contains(rawConfig)) return;
+    _deadKeys[_blacklistKey(rawConfig)] = DateTime.now().millisecondsSinceEpoch;
+  }
+
+  void _markAlive(String rawConfig) {
+    _deadKeys.remove(_blacklistKey(rawConfig));
+  }
+
+  // КОНФИГУРАЦИЯ ЯДРА (DNS и сниффинг не менять)
+
   String _buildCleanConfig(String rawConfig) {
     final v2rayURL = FlutterV2ray.parseFromURL(rawConfig);
 
-    // Только чистые валидные IP-адреса для системного VpnService Android
     v2rayURL.dns = {
       "servers": [
         "1.1.1.1",
@@ -197,7 +345,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       "queryStrategy": "UseIP"
     };
 
-    // Сниффинг строго как в v2rayNG: только http и tls
     try {
       v2rayURL.inbound['sniffing'] = {
         "enabled": true,
@@ -210,7 +357,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return jsonEncode(configMap);
   }
 
-  // Парсер сетевого эндпоинта для быстрого предварительного отсева
   ServerEndpoint? _parseEndpoint(String rawConfig) {
     try {
       final uri = Uri.tryParse(rawConfig);
@@ -258,7 +404,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return null;
   }
 
-  // Экспресс-проверка доступности сокета перед тяжелым замером Xray
   Future<bool> _fastTcpPreCheck(String rawConfig) async {
     final ep = _parseEndpoint(rawConfig);
     if (ep == null) return false;
@@ -271,7 +416,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     }
   }
 
-  // Сортировка: закрепленные сверху, далее лучшие по пингу
   void _sortNodes(List<ServerNode> list) {
     final currentSelected = (list.isNotEmpty && selectedIndex < list.length)
         ? list[selectedIndex]
@@ -303,6 +447,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       item.isPinned = !item.isPinned;
       if (item.isPinned) {
         pinnedConfigs.add(item.rawConfig);
+        _markAlive(item.rawConfig);
         _showToast("Узел закреплен вверху списка", isSuccess: true);
       } else {
         pinnedConfigs.remove(item.rawConfig);
@@ -339,87 +484,147 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     return results;
   }
 
-  // Поиск и конвейерный замер
+  // СБОР УЗЛОВ: ротация, перемешивание, отсечение черного списка
+
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
     setState(() => isSearchingGitHub = true);
 
-    _showToast("Поиск ключей в открытых реестрах...", isSuccess: true);
+    _showToast("Синхронизация узлов: опрос реестров GitHub", isSuccess: true);
 
-    List<ServerNode> collectedNodes = [];
-
-    final existingPinned = autoServers.where((s) => s.isPinned).toList();
-    collectedNodes.addAll(existingPinned);
-
-    for (final url in gitHubSources) {
-      try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
-        if (res.statusCode == 200 && res.body.isNotEmpty) {
-          final configs = _extractConfigs(res.body);
-
-          for (final config in configs) {
-            if (collectedNodes.any((n) => n.rawConfig == config)) continue;
-
-            String title = "Узел ${collectedNodes.length + 1}";
-            if (config.contains('#')) {
-              try {
-                title = Uri.decodeComponent(config.split('#').last).trim();
-              } catch (_) {
-                title = config.split('#').last;
-              }
-            }
-
-            final isPinned = pinnedConfigs.contains(config);
-            collectedNodes.add(ServerNode(
-              name: title.isEmpty ? "Узел ${collectedNodes.length + 1}" : title,
-              rawConfig: config,
-              ping: -2,
-              isPinned: isPinned,
-            ));
-            if (collectedNodes.length >= 16) break;
-          }
-        }
-      } catch (_) {
-        continue;
-      }
-      if (collectedNodes.length >= 16) break;
+    try {
+      await _runDiscoveryCycle(attempt: 0);
+    } catch (_) {
+      if (mounted) _showToast("Ошибка связи с реестрами GitHub", isSuccess: false);
+    } finally {
+      await _saveDeadKeys();
+      await _saveRotationOffset();
+      if (mounted) setState(() => isSearchingGitHub = false);
     }
-
-    if (collectedNodes.isNotEmpty && mounted) {
-      setState(() {
-        autoServers = collectedNodes;
-        _sortNodes(autoServers);
-        selectedIndex = 0;
-      });
-
-      _showToast("Получено ${collectedNodes.length} узлов. Тестирование задержки...", isSuccess: true);
-
-      // Двухступенчатый замер: TCP-отсев + честный Xray Real Delay
-      await _testNodesPipeline(autoServers);
-
-      // Автоматическое удаление нерабочих незакрепленных узлов
-      if (mounted) {
-        setState(() {
-          autoServers.removeWhere((s) => !s.isPinned && s.ping <= 0);
-          _sortNodes(autoServers);
-          if (selectedIndex >= autoServers.length) selectedIndex = 0;
-        });
-        _showToast("Проверка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
-      }
-    } else {
-      if (mounted) {
-        _showToast("Ошибка связи с реестрами GitHub", isSuccess: false);
-      }
-    }
-
-    if (mounted) setState(() => isSearchingGitHub = false);
   }
 
-  // Конвейер: быстрый параллельный фильтр, затем честный Real Delay
+  Future<List<String>> _fetchPool() async {
+    // Ротация источников: каждый цикл стартует с другого зеркала
+    final ordered = <String>[];
+    final total = gitHubSources.length;
+    for (int i = 0; i < total; i++) {
+      ordered.add(gitHubSources[(_rotationOffset + i) % total]);
+    }
+
+    // Опрашиваем первую половину списка параллельно, чтобы не ждать мертвые зеркала
+    final batch = ordered.take(6).toList();
+
+    final results = await Future.wait(batch.map((url) async {
+      try {
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
+        if (res.statusCode == 200 && res.body.isNotEmpty) {
+          return _extractConfigs(res.body);
+        }
+      } catch (_) {}
+      return <String>[];
+    }));
+
+    final pool = <String>[];
+    final seen = <String>{};
+    for (final list in results) {
+      for (final config in list) {
+        if (seen.add(config)) pool.add(config);
+      }
+    }
+    return pool;
+  }
+
+  Future<void> _runDiscoveryCycle({required int attempt}) async {
+    final pool = await _fetchPool();
+
+    if (pool.isEmpty) {
+      if (attempt < _maxAutoRetries) {
+        _rotationOffset = (_rotationOffset + 3) % gitHubSources.length;
+        if (mounted) _showToast("Поиск альтернативных узлов...", isSuccess: true);
+        await Future.delayed(const Duration(milliseconds: 400));
+        return _runDiscoveryCycle(attempt: attempt + 1);
+      }
+      if (mounted) _showToast("Реестры GitHub недоступны", isSuccess: false);
+      return;
+    }
+
+    // Отсекаем заведомо мертвые ключи до любых замеров
+    final filtered = pool.where((c) => !_isBlacklisted(c)).toList();
+    final workingPool = filtered.isNotEmpty ? filtered : pool;
+
+    // Перемешивание: каждый поиск выдает свежую выборку, а не первые строки файла
+    workingPool.shuffle(_random);
+
+    final collectedNodes = <ServerNode>[];
+    collectedNodes.addAll(autoServers.where((s) => s.isPinned));
+
+    for (final config in workingPool) {
+      if (collectedNodes.length >= _batchSize) break;
+      if (collectedNodes.any((n) => n.rawConfig == config)) continue;
+
+      String title = "Узел ${collectedNodes.length + 1}";
+      if (config.contains('#')) {
+        try {
+          title = Uri.decodeComponent(config.split('#').last).trim();
+        } catch (_) {
+          title = config.split('#').last;
+        }
+      }
+      if (title.isEmpty) title = "Узел ${collectedNodes.length + 1}";
+      if (title.length > 42) title = title.substring(0, 42);
+
+      collectedNodes.add(ServerNode(
+        name: title,
+        rawConfig: config,
+        ping: -2,
+        isPinned: pinnedConfigs.contains(config),
+      ));
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      autoServers = collectedNodes;
+      _sortNodes(autoServers);
+      selectedIndex = 0;
+    });
+
+    _showToast("Получено узлов: ${collectedNodes.length}. Замер задержки", isSuccess: true);
+
+    await _testNodesPipeline(autoServers);
+
+    if (!mounted) return;
+
+    setState(() {
+      for (final node in autoServers) {
+        if (!node.isPinned && node.ping <= 0 && node.ping != -2) {
+          _markDead(node.rawConfig);
+        }
+      }
+      autoServers.removeWhere((s) => !s.isPinned && s.ping <= 0);
+      _sortNodes(autoServers);
+      if (selectedIndex >= autoServers.length) selectedIndex = 0;
+    });
+
+    // ЗАЩИТНЫЙ АЛГОРИТМ: пустой список запускает следующее смещение источников
+    if (autoServers.isEmpty && attempt < _maxAutoRetries) {
+      _rotationOffset = (_rotationOffset + 2) % gitHubSources.length;
+      _showToast("Поиск альтернативных узлов...", isSuccess: true);
+      await Future.delayed(const Duration(milliseconds: 300));
+      return _runDiscoveryCycle(attempt: attempt + 1);
+    }
+
+    if (autoServers.isEmpty) {
+      _showToast("Стабильных узлов не найдено. Повторите синхронизацию", isSuccess: false);
+    } else {
+      _rotationOffset = (_rotationOffset + 1) % gitHubSources.length;
+      _showToast("Проверка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
+    }
+  }
+
   Future<void> _testNodesPipeline(List<ServerNode> nodes) async {
     List<ServerNode> candidates = [];
 
-    // Шаг 1: Мгновенный TCP-отсев мертвых IP (до 0.9 сек)
     await Future.wait(nodes.map((node) async {
       final reachable = await _fastTcpPreCheck(node.rawConfig);
       if (reachable) {
@@ -429,7 +634,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       }
     }));
 
-    // Шаг 2: Честный замер Real Delay через Xray только для живых серверов
     const int chunkSize = 2;
     for (int i = 0; i < candidates.length; i += chunkSize) {
       if (!mounted) break;
@@ -439,7 +643,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     }
   }
 
-  // Честный замер Real Delay через ядро Xray (по стандарту v2rayNG)
   Future<void> _testNodeRealDelay(ServerNode node) async {
     if (!mounted) return;
     setState(() => node.ping = -2);
@@ -469,6 +672,12 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       delay = -1;
     }
 
+    if (delay > 0) {
+      _markAlive(node.rawConfig);
+    } else {
+      _markDead(node.rawConfig);
+    }
+
     if (mounted) {
       setState(() {
         node.ping = delay;
@@ -477,14 +686,14 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     }
   }
 
-  // Выбор сервера с мягким переподключением на лету
+  // УПРАВЛЕНИЕ ТУННЕЛЕМ
+
   Future<void> _selectAndSwitchServer(int idx) async {
     final activeList = currentTab == 0 ? autoServers : customServers;
     if (activeList.isEmpty || idx >= activeList.length) return;
 
     final targetNode = activeList[idx];
 
-    // Если соединение активно и выбран другой сервер — выполняем переподключение
     if ((isConnected || isConnecting) && idx != selectedIndex) {
       setState(() {
         selectedIndex = idx;
@@ -496,7 +705,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
       try {
         await flutterV2ray.stopV2Ray();
-        await Future.delayed(const Duration(milliseconds: 150));
+        // Пауза на освобождение системного сокета Android VpnService
+        await Future.delayed(const Duration(milliseconds: 180));
+        // Снимаем флаг до старта, иначе событие CONNECTED будет отброшено
+        if (mounted) setState(() => _isReconnecting = false);
         await _startTunnel(targetNode);
       } catch (_) {
         if (mounted) {
@@ -520,7 +732,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     }
   }
 
-  // Запуск VPN-туннеля
   Future<void> _startTunnel(ServerNode node) async {
     _isManuallyStopped = false;
     setState(() => isConnecting = true);
@@ -541,7 +752,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         );
 
         if (mounted) {
-          _showToast("VPN активирован: ${node.name}", isSuccess: true);
+          _showToast("Соединение активно: ${node.name}", isSuccess: true);
         }
       } else {
         if (mounted) {
@@ -550,7 +761,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
           _showToast("Разрешение отклонено", isSuccess: false);
         }
       }
-    } catch (e) {
+    } catch (_) {
       if (mounted) {
         setState(() => isConnecting = false);
         _gearController.stop();
@@ -562,7 +773,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   void _handleToggle() async {
     final activeList = currentTab == 0 ? autoServers : customServers;
     if (activeList.isEmpty) {
-      _showToast("Список узлов пуст. Нажмите поиск вверху", isSuccess: false);
+      _showToast("Список узлов пуст. Запустите синхронизацию", isSuccess: false);
+      if (currentTab == 0 && !isSearchingGitHub) _searchGitHubForKeys();
       return;
     }
 
@@ -592,10 +804,17 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
     final before = list.length;
     setState(() {
+      for (final node in list) {
+        if (!node.isPinned && node.ping <= 0 && node.ping != -2) {
+          _markDead(node.rawConfig);
+        }
+      }
       list.removeWhere((s) => !s.isPinned && s.ping <= 0 && s.ping != -2);
       _sortNodes(list);
       if (selectedIndex >= list.length) selectedIndex = 0;
     });
+
+    _saveDeadKeys();
 
     final removedCount = before - list.length;
     if (currentTab == 1) {
@@ -607,22 +826,49 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } else {
       _showToast("Все узлы в списке активны", isSuccess: true);
     }
+
+    if (currentTab == 0 && autoServers.isEmpty && !isSearchingGitHub) {
+      _searchGitHubForKeys();
+    }
   }
 
   void _showToast(String message, {required bool isSuccess}) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
-          message,
-          style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+        content: Row(
+          children: [
+            Icon(
+              isSuccess ? Icons.check_circle_outline : Icons.error_outline,
+              size: 16,
+              color: isSuccess ? const Color(0xFFA5D6A7) : const Color(0xFFFFCDD2),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(color: Colors.white, fontSize: 12.5, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ],
         ),
-        backgroundColor: isSuccess ? const Color(0xFF2E7D32) : const Color(0xFFC62828),
+        backgroundColor: isSuccess ? const Color(0xFF1E4620) : const Color(0xFF4A1C1C),
         behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        elevation: 0,
+        duration: const Duration(milliseconds: 2400),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: BorderSide(
+            color: isSuccess ? const Color(0xFF3D7A40) : const Color(0xFF8E3B3B),
+            width: 1,
+          ),
+        ),
       ),
     );
   }
+
+  // ДИАЛОГИ
 
   void _showAddKeyDialog() {
     final nameController = TextEditingController();
@@ -634,13 +880,14 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         backgroundColor: const Color(0xFF1B1917),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(14),
-          side: const BorderSide(color: Color(0xFFC5A059), width: 1.2),
+          side: const BorderSide(color: Palette.brass, width: 1.2),
         ),
         title: Row(
           children: const [
-            Icon(Icons.add_link, color: Color(0xFFC5A059)),
+            Icon(Icons.add_link, color: Palette.brass),
             SizedBox(width: 10),
-            Text("Добавить свой ключ", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text("Добавить свой ключ",
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
           ],
         ),
         content: SingleChildScrollView(
@@ -655,8 +902,12 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                   hintStyle: const TextStyle(color: Color(0xFF756D65), fontSize: 12),
                   filled: true,
                   fillColor: const Color(0xFF13110F),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF3B352E))),
-                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFC5A059))),
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Color(0xFF3B352E))),
+                  focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Palette.brass)),
                 ),
               ),
               const SizedBox(height: 12),
@@ -669,8 +920,12 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
                   hintStyle: const TextStyle(color: Color(0xFF756D65), fontSize: 12),
                   filled: true,
                   fillColor: const Color(0xFF13110F),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF3B352E))),
-                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFC5A059))),
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Color(0xFF3B352E))),
+                  focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Palette.brass)),
                 ),
               ),
             ],
@@ -682,7 +937,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
             child: const Text("ОТМЕНА", style: TextStyle(color: Color(0xFF8C827A))),
           ),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFC5A059)),
+            style: ElevatedButton.styleFrom(backgroundColor: Palette.brass),
             onPressed: () {
               final raw = configController.text.trim();
               if (raw.isEmpty) return;
@@ -719,7 +974,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               Navigator.pop(context);
               _showToast("Ключ сохранен", isSuccess: true);
             },
-            child: const Text("ДОБАВИТЬ", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+            child: const Text("ДОБАВИТЬ",
+                style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -733,32 +989,40 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         backgroundColor: const Color(0xFF1B1917),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(16),
-          side: const BorderSide(color: Color(0xFFC5A059), width: 1.2),
+          side: const BorderSide(color: Palette.brass, width: 1.2),
         ),
         title: Row(
           children: const [
-            Icon(Icons.info_outline, color: Color(0xFFC5A059)),
+            Icon(Icons.info_outline, color: Palette.brass),
             SizedBox(width: 10),
-            Text("Архитектура системы", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            Text("Архитектура системы",
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
           ],
         ),
         content: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: const [
-              Text(
+            children: [
+              const Text(
                 "Принципы работы Scale VPN:",
-                style: TextStyle(color: Color(0xFFC5A059), fontWeight: FontWeight.bold, fontSize: 13),
+                style: TextStyle(color: Palette.brass, fontWeight: FontWeight.bold, fontSize: 13),
               ),
-              SizedBox(height: 8),
-              Text(
+              const SizedBox(height: 8),
+              const Text(
                 "1. Сбор реестров GitHub:\n"
-                "Опрос открытых баз VLESS Reality и Shadowsocks каждые 15 минут.\n\n"
-                "2. Честный замер Real Delay:\n"
+                "Параллельный опрос открытых баз VLESS Reality и Shadowsocks с ротацией зеркал и случайной выборкой узлов.\n\n"
+                "2. Черный список:\n"
+                "Эндпоинты с подтвержденным таймаутом отсекаются до замера и хранятся 6 часов.\n\n"
+                "3. Честный замер Real Delay:\n"
                 "Опрос узлов через ядро Xray до gstatic.com/generate_204 по стандарту v2rayNG с автоматической сортировкой.\n\n"
-                "3. Чистый DNS и маршрутизация:\n"
+                "4. Чистый DNS и маршрутизация:\n"
                 "Штатная конфигурация DNS 1.1.1.1 и 8.8.8.8 со сниффингом TLS/HTTP без дедлоков видеопотоков YouTube.",
                 style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 12.5, height: 1.45),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                "Записей в черном списке: ${_deadKeys.length}\nТекущее смещение реестров: $_rotationOffset",
+                style: const TextStyle(color: Palette.textMuted, fontSize: 11.5, height: 1.4),
               ),
             ],
           ),
@@ -766,11 +1030,28 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: const Text("ЗАКРЫТЬ", style: TextStyle(color: Color(0xFFC5A059), fontWeight: FontWeight.bold)),
+            child: const Text("ЗАКРЫТЬ",
+                style: TextStyle(color: Palette.brass, fontWeight: FontWeight.bold)),
           ),
         ],
       ),
     );
+  }
+
+  // ВИЗУАЛЬНЫЕ ЭЛЕМЕНТЫ
+
+  Color _pingColor(int ping) {
+    if (ping <= 0) return Palette.danger;
+    if (ping < 350) return Palette.good;
+    if (ping < 900) return Palette.average;
+    return const Color(0xFFFF7043);
+  }
+
+  int _signalBars(int ping) {
+    if (ping <= 0) return 0;
+    if (ping < 350) return 3;
+    if (ping < 900) return 2;
+    return 1;
   }
 
   Widget _buildPingBadge(int ping) {
@@ -778,370 +1059,593 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       return const SizedBox(
         width: 12,
         height: 12,
-        child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFFC5A059)),
+        child: CircularProgressIndicator(strokeWidth: 1.5, color: Palette.brass),
       );
     }
     if (ping <= 0) {
       return const Text(
         "Таймаут",
-        style: TextStyle(color: Color(0xFFE53935), fontSize: 11, fontWeight: FontWeight.bold),
+        style: TextStyle(color: Palette.danger, fontSize: 11, fontWeight: FontWeight.bold),
       );
     }
     return Text(
       "$ping ms",
-      style: const TextStyle(color: Color(0xFF66BB6A), fontSize: 11, fontWeight: FontWeight.bold),
+      style: TextStyle(color: _pingColor(ping), fontSize: 11, fontWeight: FontWeight.bold),
+    );
+  }
+
+  Widget _buildSignalMeter(int ping) {
+    final bars = _signalBars(ping);
+    final color = _pingColor(ping);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: List.generate(3, (i) {
+        final active = i < bars;
+        return Container(
+          margin: const EdgeInsets.only(left: 2),
+          width: 3.5,
+          height: 5.0 + i * 3.5,
+          decoration: BoxDecoration(
+            color: active ? color : const Color(0xFF3A342E),
+            borderRadius: BorderRadius.circular(1),
+          ),
+        );
+      }),
+    );
+  }
+
+  // АНАЛОГОВО-ЦИФРОВОЙ ДАТЧИК ЗАДЕРЖКИ
+  Widget _buildGauge(ServerNode? node) {
+    final ping = node?.ping ?? -1;
+    final hasNode = node != null;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF1D1A17), Color(0xFF131110)],
+        ),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: const Color(0xFF3A332B), width: 1.1),
+        boxShadow: const [
+          BoxShadow(color: Color(0x99000000), blurRadius: 10, offset: Offset(0, 4)),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 22,
+            height: 22,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: isConnected ? Palette.brassGradient : Palette.steelGradient,
+              boxShadow: const [BoxShadow(color: Color(0xAA000000), blurRadius: 4)],
+            ),
+            child: Icon(
+              Icons.speed,
+              size: 13,
+              color: isConnected ? const Color(0xFF2A2010) : const Color(0xFF9C948B),
+            ),
+          ),
+          const SizedBox(width: 10),
+          const Text("ЗАДЕРЖКА",
+              style: TextStyle(
+                  color: Palette.textMuted, fontSize: 9.5, letterSpacing: 1.4, fontWeight: FontWeight.bold)),
+          const SizedBox(width: 8),
+          Container(width: 1, height: 16, color: const Color(0xFF322C26)),
+          const SizedBox(width: 8),
+          hasNode
+              ? _buildPingBadge(ping)
+              : const Text("—", style: TextStyle(color: Palette.textMuted, fontSize: 11)),
+          const SizedBox(width: 8),
+          _buildSignalMeter(hasNode ? ping : -1),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBrassIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    Widget? customChild,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 8),
+      child: Tooltip(
+        message: tooltip,
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(9),
+            onTap: onPressed,
+            child: Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Color(0xFF221F1B), Color(0xFF161412)],
+                ),
+                borderRadius: BorderRadius.circular(9),
+                border: Border.all(color: const Color(0xFF3A332B), width: 1),
+              ),
+              child: Center(
+                child: customChild ?? Icon(icon, color: Palette.brass, size: 18),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
     final activeList = currentTab == 0 ? autoServers : customServers;
-    final activeNode = activeList.isNotEmpty && selectedIndex < activeList.length ? activeList[selectedIndex] : null;
+    final activeNode =
+        activeList.isNotEmpty && selectedIndex < activeList.length ? activeList[selectedIndex] : null;
 
     return Scaffold(
-      body: SafeArea(
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(7),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF1F1D1A),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: const Color(0xFFC5A059), width: 1.2),
-                        ),
-                        child: const Icon(Icons.security, color: Color(0xFFC5A059), size: 18),
-                      ),
-                      const SizedBox(width: 12),
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: const [
-                          Text(
-                            "SCALE VPN",
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 2,
-                            ),
-                          ),
-                          Text(
-                            "GitHub Key Engine",
-                            style: TextStyle(color: Color(0xFF8C827A), fontSize: 10),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                  Row(
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.cleaning_services_outlined, color: Color(0xFFC5A059), size: 20),
-                        tooltip: "Удалить нерабочие ключи",
-                        onPressed: _purgeDeadNodes,
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.help_outline, color: Color(0xFFC5A059), size: 22),
-                        tooltip: "О системе",
-                        onPressed: _showInfoDialog,
-                      ),
-                      IconButton(
-                        icon: isSearchingGitHub
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(color: Color(0xFFC5A059), strokeWidth: 2),
-                              )
-                            : const Icon(Icons.sync, color: Color(0xFFC5A059), size: 22),
-                        tooltip: "Искать ключи на GitHub",
-                        onPressed: isSearchingGitHub ? null : _searchGitHubForKeys,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-
-            const Spacer(),
-
-            // ЦЕНТРАЛЬНАЯ КНОПКА ПОДКЛЮЧЕНИЯ
-            GestureDetector(
-              onTap: _handleToggle,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    width: 210,
-                    height: 210,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        BoxShadow(
-                          color: isConnected ? const Color(0x4DFF9800) : Colors.transparent,
-                          blurRadius: 40,
-                          spreadRadius: 10,
-                        ),
-                      ],
-                    ),
-                  ),
-                  RotationTransition(
-                    turns: _gearController,
-                    child: CustomPaint(
-                      size: const Size(190, 190),
-                      painter: PolishedGearPainter(isActive: isConnected),
-                    ),
-                  ),
-                  Container(
-                    width: 78,
-                    height: 78,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: const Color(0xFF141210),
-                      border: Border.all(
-                        color: isConnected ? const Color(0xFFFF9800) : const Color(0xFF4A443E),
-                        width: 2.5,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: isConnected ? const Color(0x80FF9800) : Colors.black87,
-                          blurRadius: isConnected ? 16 : 4,
-                        ),
-                      ],
-                    ),
-                    child: Icon(
-                      Icons.power_settings_new,
-                      size: 38,
-                      color: isConnected
-                          ? const Color(0xFFFFB74D)
-                          : (_isReconnecting || isConnecting ? const Color(0xFFC5A059) : const Color(0xFF6B635B)),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 20),
-
-            Text(
-              isConnected
-                  ? "СОЕДИНЕНИЕ АКТИВНО"
-                  : (_isReconnecting
-                      ? "ПЕРЕПОДКЛЮЧЕНИЕ..."
-                      : (isConnecting ? "ПОДКЛЮЧЕНИЕ..." : "ОТКЛЮЧЕНО")),
-              style: TextStyle(
-                color: isConnected
-                    ? const Color(0xFFFFB74D)
-                    : (_isReconnecting || isConnecting ? const Color(0xFFC5A059) : const Color(0xFF9E948A)),
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 2,
-              ),
-            ),
-
-            const SizedBox(height: 8),
-
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFF181614),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: const Color(0xFF38332E)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.speed, size: 15, color: isConnected ? const Color(0xFFC5A059) : const Color(0xFF6B635B)),
-                  const SizedBox(width: 8),
-                  const Text("Пинг: ", style: TextStyle(color: Color(0xFFD6D3D1), fontSize: 11)),
-                  activeNode != null
-                      ? _buildPingBadge(activeNode.ping)
-                      : const Text("—", style: TextStyle(color: Color(0xFF8C827A), fontSize: 11)),
-                ],
-              ),
-            ),
-
-            const Spacer(),
-
-            // НИЖНЯЯ ПАНЕЛЬ С СЕРВЕРАМИ GITHUB
-            Container(
-              height: 240,
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
-              decoration: const BoxDecoration(
-                color: Color(0xFF13110F),
-                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-                border: Border(top: BorderSide(color: Color(0xFF292420), width: 1.2)),
-              ),
-              child: Column(
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        children: [
-                          _buildTabButton("GitHub Реестр", 0),
-                          const SizedBox(width: 8),
-                          _buildTabButton("Свои ключи", 1),
-                        ],
-                      ),
-                      Row(
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.cleaning_services, color: Color(0xFFC5A059), size: 18),
-                            tooltip: "Очистить нерабочие узлы",
-                            onPressed: _purgeDeadNodes,
-                          ),
-                          if (currentTab == 1)
-                            IconButton(
-                              icon: const Icon(Icons.add_circle_outline, color: Color(0xFFC5A059), size: 22),
-                              tooltip: "Добавить ключ",
-                              onPressed: _showAddKeyDialog,
-                            ),
-                        ],
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-
-                  Expanded(
-                    child: activeList.isEmpty
-                        ? Center(
-                            child: isSearchingGitHub
-                                ? const CircularProgressIndicator(color: Color(0xFFC5A059))
-                                : TextButton.icon(
-                                    icon: const Icon(Icons.search, color: Color(0xFFC5A059), size: 16),
-                                    label: const Text("Найти рабочие ключи на GitHub", style: TextStyle(color: Color(0xFFC5A059), fontSize: 12)),
-                                    onPressed: _searchGitHubForKeys,
-                                  ),
-                          )
-                        : ListView.builder(
-                            itemCount: activeList.length,
-                            itemBuilder: (context, idx) {
-                              final item = activeList[idx];
-                              final isCurrent = idx == selectedIndex;
-                              return GestureDetector(
-                                onTap: () => _selectAndSwitchServer(idx),
-                                child: Container(
-                                  margin: const EdgeInsets.only(bottom: 6),
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                  decoration: BoxDecoration(
-                                    color: isCurrent ? const Color(0xFF24201C) : const Color(0xFF1A1815),
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(
-                                      color: isCurrent ? const Color(0xFFC5A059) : const Color(0xFF2E2924),
-                                      width: isCurrent ? 1.2 : 0.8,
-                                    ),
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      Expanded(
-                                        child: Row(
-                                          children: [
-                                            Container(
-                                              width: 8,
-                                              height: 8,
-                                              decoration: BoxDecoration(
-                                                shape: BoxShape.circle,
-                                                color: item.isPinned
-                                                    ? const Color(0xFFFF9800)
-                                                    : (isCurrent ? const Color(0xFFC5A059) : const Color(0xFF5A524A)),
-                                              ),
-                                            ),
-                                            const SizedBox(width: 8),
-                                            if (item.isPinned)
-                                              const Padding(
-                                                padding: EdgeInsets.only(right: 6),
-                                                child: Icon(Icons.push_pin, size: 13, color: Color(0xFFFF9800)),
-                                              ),
-                                            Expanded(
-                                              child: Text(
-                                                item.name,
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  color: isCurrent ? Colors.white : const Color(0xFFD6D3D1),
-                                                  fontSize: 12,
-                                                  fontWeight: (isCurrent || item.isPinned) ? FontWeight.bold : FontWeight.normal,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                      Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          _buildPingBadge(item.ping),
-                                          const SizedBox(width: 4),
-                                          IconButton(
-                                            icon: Icon(
-                                              item.isPinned ? Icons.push_pin : Icons.push_pin_outlined,
-                                              size: 16,
-                                              color: item.isPinned ? const Color(0xFFFF9800) : const Color(0xFF8C827A),
-                                            ),
-                                            visualDensity: VisualDensity.compact,
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                            tooltip: item.isPinned ? "Открепить узел" : "Закрепить узел вверху",
-                                            onPressed: () => _togglePin(item),
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(Icons.network_check, size: 16, color: Color(0xFFC5A059)),
-                                            visualDensity: VisualDensity.compact,
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                            tooltip: "Замерить задержку",
-                                            onPressed: () => _testNodeRealDelay(item),
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(Icons.copy, size: 15, color: Color(0xFF8C827A)),
-                                            visualDensity: VisualDensity.compact,
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                            tooltip: "Скопировать ключ",
-                                            onPressed: () {
-                                              Clipboard.setData(ClipboardData(text: item.rawConfig));
-                                              _showToast("Ключ скопирован в буфер", isSuccess: true);
-                                            },
-                                          ),
-                                          if (item.isCustom)
-                                            IconButton(
-                                              icon: const Icon(Icons.delete_outline, size: 16, color: Color(0xFFC62828)),
-                                              visualDensity: VisualDensity.compact,
-                                              padding: EdgeInsets.zero,
-                                              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                                              tooltip: "Удалить",
-                                              onPressed: () {
-                                                setState(() {
-                                                  customServers.removeAt(idx);
-                                                  if (selectedIndex >= customServers.length) selectedIndex = 0;
-                                                });
-                                                _saveCustomKeysToStorage();
-                                                _showToast("Ключ удален", isSuccess: false);
-                                              },
-                                            ),
-                                        ],
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                  ),
-                ],
-              ),
-            ),
-          ],
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: RadialGradient(
+            center: Alignment(0, -0.35),
+            radius: 1.1,
+            colors: [Color(0xFF17150F), Palette.background],
+            stops: [0.0, 1.0],
+          ),
+        ),
+        child: SafeArea(
+          child: Column(
+            children: [
+              _buildHeader(),
+              const Spacer(),
+              _buildPowerControl(),
+              const SizedBox(height: 22),
+              _buildStatusLabel(),
+              const SizedBox(height: 12),
+              _buildGauge(activeNode),
+              const Spacer(),
+              _buildServerPanel(activeList),
+            ],
+          ),
         ),
       ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 12, 12, 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  gradient: Palette.brassGradient,
+                  borderRadius: BorderRadius.circular(10),
+                  boxShadow: const [
+                    BoxShadow(color: Color(0xAA000000), blurRadius: 8, offset: Offset(0, 3)),
+                  ],
+                ),
+                child: const Icon(Icons.security, color: Color(0xFF241B0C), size: 20),
+              ),
+              const SizedBox(width: 12),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  ShaderMask(
+                    shaderCallback: (rect) => Palette.brassGradient.createShader(rect),
+                    child: const Text(
+                      "SCALE VPN",
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16.5,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 2.4,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 1),
+                  const Text(
+                    "GITHUB KEY ENGINE",
+                    style: TextStyle(color: Palette.textMuted, fontSize: 9, letterSpacing: 1.2),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              _buildBrassIconButton(
+                icon: Icons.cleaning_services_outlined,
+                tooltip: "Удалить нерабочие узлы",
+                onPressed: _purgeDeadNodes,
+              ),
+              _buildBrassIconButton(
+                icon: Icons.help_outline,
+                tooltip: "О системе",
+                onPressed: _showInfoDialog,
+              ),
+              _buildBrassIconButton(
+                icon: Icons.sync,
+                tooltip: "Синхронизация узлов",
+                onPressed: isSearchingGitHub ? null : _searchGitHubForKeys,
+                customChild: isSearchingGitHub
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(color: Palette.brass, strokeWidth: 2),
+                      )
+                    : null,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPowerControl() {
+    return GestureDetector(
+      onTap: _handleToggle,
+      child: AnimatedBuilder(
+        animation: _glowController,
+        builder: (context, child) {
+          final pulse = 0.6 + (_glowController.value * 0.4);
+          return Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: 226,
+                height: 226,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: isConnected ? amberTint(0.22 * pulse) : Colors.transparent,
+                      blurRadius: 48,
+                      spreadRadius: 12,
+                    ),
+                  ],
+                ),
+              ),
+              CustomPaint(
+                size: const Size(206, 206),
+                painter: BezelPainter(isActive: isConnected),
+              ),
+              RotationTransition(
+                turns: _gearController,
+                child: CustomPaint(
+                  size: const Size(186, 186),
+                  painter: PolishedGearPainter(isActive: isConnected),
+                ),
+              ),
+              Container(
+                width: 84,
+                height: 84,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const RadialGradient(
+                    center: Alignment(-0.3, -0.4),
+                    radius: 1.0,
+                    colors: [Color(0xFF262220), Color(0xFF121010), Color(0xFF0A0908)],
+                    stops: [0.0, 0.6, 1.0],
+                  ),
+                  border: Border.all(
+                    color: isConnected ? Palette.amber : const Color(0xFF4A443E),
+                    width: 2.4,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: isConnected ? amberTint(0.45 * pulse) : Colors.black87,
+                      blurRadius: isConnected ? 20 : 6,
+                      spreadRadius: isConnected ? 1 : 0,
+                    ),
+                  ],
+                ),
+                child: Icon(
+                  Icons.power_settings_new,
+                  size: 38,
+                  color: isConnected
+                      ? Palette.amberSoft
+                      : (_isReconnecting || isConnecting ? Palette.brass : const Color(0xFF6B635B)),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildStatusLabel() {
+    final String label = isConnected
+        ? "СОЕДИНЕНИЕ АКТИВНО"
+        : (_isReconnecting ? "ПЕРЕПОДКЛЮЧЕНИЕ..." : (isConnecting ? "ПОДКЛЮЧЕНИЕ..." : "ОТКЛЮЧЕНО"));
+
+    final Color color = isConnected
+        ? Palette.amberSoft
+        : (_isReconnecting || isConnecting ? Palette.brass : const Color(0xFF9E948A));
+
+    return Column(
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: 12.5,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 2.6,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Container(
+          width: 120,
+          height: 1.2,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                Colors.transparent,
+                isConnected ? amberTint(0.8) : const Color(0xFF3A332B),
+                Colors.transparent,
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildServerPanel(List<ServerNode> activeList) {
+    return Container(
+      height: 252,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF181513), Palette.panel],
+        ),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+        border: Border(top: BorderSide(color: Color(0xFF3A332B), width: 1.2)),
+        boxShadow: [BoxShadow(color: Color(0xCC000000), blurRadius: 18, offset: Offset(0, -6))],
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  _buildTabButton("GitHub Реестр", 0),
+                  const SizedBox(width: 8),
+                  _buildTabButton("Свои ключи", 1),
+                ],
+              ),
+              Row(
+                children: [
+                  if (currentTab == 1)
+                    IconButton(
+                      icon: const Icon(Icons.add_circle_outline, color: Palette.brass, size: 21),
+                      tooltip: "Добавить ключ",
+                      visualDensity: VisualDensity.compact,
+                      constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+                      onPressed: _showAddKeyDialog,
+                    ),
+                  IconButton(
+                    icon: const Icon(Icons.cleaning_services, color: Palette.brass, size: 17),
+                    tooltip: "Очистить нерабочие узлы",
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+                    onPressed: _purgeDeadNodes,
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: activeList.isEmpty ? _buildEmptyState() : _buildNodeList(activeList),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyState() {
+    if (isSearchingGitHub) {
+      return const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 26,
+              height: 26,
+              child: CircularProgressIndicator(color: Palette.brass, strokeWidth: 2.2),
+            ),
+            SizedBox(height: 12),
+            Text("Синхронизация узлов",
+                style: TextStyle(color: Palette.textMuted, fontSize: 11.5, letterSpacing: 1)),
+          ],
+        ),
+      );
+    }
+
+    if (currentTab == 1) {
+      return Center(
+        child: TextButton.icon(
+          icon: const Icon(Icons.add_link, color: Palette.brass, size: 16),
+          label: const Text("Добавить собственный ключ",
+              style: TextStyle(color: Palette.brass, fontSize: 12)),
+          onPressed: _showAddKeyDialog,
+        ),
+      );
+    }
+
+    return Center(
+      child: TextButton.icon(
+        icon: const Icon(Icons.travel_explore, color: Palette.brass, size: 16),
+        label: const Text("Найти рабочие узлы в реестрах GitHub",
+            style: TextStyle(color: Palette.brass, fontSize: 12)),
+        onPressed: _searchGitHubForKeys,
+      ),
+    );
+  }
+
+  Widget _buildNodeList(List<ServerNode> activeList) {
+    return ListView.builder(
+      padding: EdgeInsets.zero,
+      itemCount: activeList.length,
+      itemBuilder: (context, idx) {
+        final item = activeList[idx];
+        final isCurrent = idx == selectedIndex;
+
+        return GestureDetector(
+          onTap: () => _selectAndSwitchServer(idx),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            margin: const EdgeInsets.only(bottom: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+                colors: isCurrent
+                    ? [const Color(0xFF2A241D), const Color(0xFF1D1916)]
+                    : [const Color(0xFF1B1916), const Color(0xFF161412)],
+              ),
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(
+                color: isCurrent ? Palette.brass : const Color(0xFF2E2924),
+                width: isCurrent ? 1.2 : 0.8,
+              ),
+              boxShadow: isCurrent
+                  ? const [BoxShadow(color: Color(0x66000000), blurRadius: 8, offset: Offset(0, 2))]
+                  : null,
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: item.isPinned
+                        ? Palette.amber
+                        : (isCurrent ? Palette.brass : const Color(0xFF5A524A)),
+                    boxShadow: isCurrent || item.isPinned
+                        ? [
+                            BoxShadow(
+                              color: item.isPinned ? amberTint(0.5) : brassTint(0.5),
+                              blurRadius: 6,
+                            )
+                          ]
+                        : null,
+                  ),
+                ),
+                const SizedBox(width: 9),
+                if (item.isPinned)
+                  const Padding(
+                    padding: EdgeInsets.only(right: 5),
+                    child: Icon(Icons.push_pin, size: 12.5, color: Palette.amber),
+                  ),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        item.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: isCurrent ? Colors.white : Palette.textPrimary,
+                          fontSize: 12,
+                          fontWeight: (isCurrent || item.isPinned) ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          _buildPingBadge(item.ping),
+                          const SizedBox(width: 6),
+                          if (item.ping > 0) _buildSignalMeter(item.ping),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 4),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        item.isPinned ? Icons.push_pin : Icons.push_pin_outlined,
+                        size: 16,
+                        color: item.isPinned ? Palette.amber : Palette.textMuted,
+                      ),
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                      tooltip: item.isPinned ? "Открепить узел" : "Закрепить узел вверху",
+                      onPressed: () => _togglePin(item),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.network_check, size: 16, color: Palette.brass),
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                      tooltip: "Замерить задержку",
+                      onPressed: () => _testNodeRealDelay(item),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.copy, size: 15, color: Palette.textMuted),
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                      tooltip: "Скопировать ключ",
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: item.rawConfig));
+                        _showToast("Ключ скопирован в буфер", isSuccess: true);
+                      },
+                    ),
+                    if (item.isCustom)
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline, size: 16, color: Color(0xFFC62828)),
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                        tooltip: "Удалить",
+                        onPressed: () {
+                          setState(() {
+                            customServers.remove(item);
+                            pinnedConfigs.remove(item.rawConfig);
+                            if (selectedIndex >= customServers.length) selectedIndex = 0;
+                          });
+                          _saveCustomKeysToStorage();
+                          _savePinnedKeysToStorage();
+                          _showToast("Ключ удален", isSuccess: false);
+                        },
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -1152,22 +1656,31 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
         currentTab = index;
         selectedIndex = 0;
       }),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
         decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFF2B251E) : Colors.transparent,
+          gradient: isSelected
+              ? const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Color(0xFF322A20), Color(0xFF221D18)],
+                )
+              : null,
+          color: isSelected ? null : Colors.transparent,
           borderRadius: BorderRadius.circular(8),
           border: Border.all(
-            color: isSelected ? const Color(0xFFC5A059) : const Color(0xFF332E29),
+            color: isSelected ? Palette.brass : const Color(0xFF332E29),
             width: 1,
           ),
         ),
         child: Text(
           title,
           style: TextStyle(
-            color: isSelected ? const Color(0xFFC5A059) : const Color(0xFF8C827A),
+            color: isSelected ? Palette.brass : Palette.textMuted,
             fontSize: 11.5,
             fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+            letterSpacing: 0.3,
           ),
         ),
       ),
@@ -1175,6 +1688,49 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   }
 }
 
+// НЕПОДВИЖНОЕ ВНЕШНЕЕ КОЛЬЦО-БЕЗЕЛЬ С НАСЕЧКОЙ
+class BezelPainter extends CustomPainter {
+  final bool isActive;
+
+  BezelPainter({required this.isActive});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2 - 2;
+    final rect = Rect.fromCircle(center: center, radius: radius);
+
+    final ringPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3
+      ..shader = (isActive ? Palette.brassGradient : Palette.steelGradient).createShader(rect);
+
+    canvas.drawCircle(center, radius, ringPaint);
+
+    final tickPaint = Paint()
+      ..color = isActive ? const Color(0xFF6E5626) : const Color(0xFF2C2723)
+      ..strokeWidth = 1.6
+      ..strokeCap = StrokeCap.round;
+
+    const ticks = 60;
+    for (int i = 0; i < ticks; i++) {
+      final a = (i * 2 * math.pi) / ticks;
+      final isMajor = i % 5 == 0;
+      final rOuter = radius - 5;
+      final rInner = radius - (isMajor ? 12 : 8);
+      canvas.drawLine(
+        Offset(center.dx + rInner * math.cos(a), center.dy + rInner * math.sin(a)),
+        Offset(center.dx + rOuter * math.cos(a), center.dy + rOuter * math.sin(a)),
+        tickPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant BezelPainter oldDelegate) => oldDelegate.isActive != isActive;
+}
+
+// ШЛИФОВАННАЯ ЛАТУННАЯ ШЕСТЕРНЯ
 class PolishedGearPainter extends CustomPainter {
   final bool isActive;
 
@@ -1184,14 +1740,21 @@ class PolishedGearPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
     final outerR = size.width / 2 - 4;
-    final innerR = outerR - 14;
+    final innerR = outerR - 15;
     const teeth = 12;
 
-    final brassColor = isActive ? const Color(0xFFC5A059) : const Color(0xFF4A443E);
-    final darkEdge = const Color(0xFF1F1D1A);
+    final rect = Rect.fromCircle(center: center, radius: outerR);
+    final gradient = isActive ? Palette.brassGradient : Palette.steelGradient;
 
-    final gearPaint = Paint()..color = brassColor..style = PaintingStyle.fill;
-    final edgePaint = Paint()..color = darkEdge..style = PaintingStyle.stroke..strokeWidth = 2;
+    final gearPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..shader = gradient.createShader(rect);
+
+    final edgePaint = Paint()
+      ..color = const Color(0xFF16130F)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..strokeJoin = StrokeJoin.round;
 
     final path = Path();
     for (int i = 0; i < teeth; i++) {
@@ -1217,19 +1780,72 @@ class PolishedGearPainter extends CustomPainter {
     }
     path.close();
 
+    // Тень под корпусом шестерни
+    canvas.drawPath(
+      path.shift(const Offset(0, 3)),
+      Paint()
+        ..color = const Color(0x88000000)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
+    );
+
     canvas.drawPath(path, gearPaint);
     canvas.drawPath(path, edgePaint);
 
-    final rimR = innerR - 16;
-    canvas.drawCircle(center, rimR, Paint()..color = const Color(0xFF141210));
-    canvas.drawCircle(center, rimR, edgePaint);
+    // Верхний блик шлифовки
+    final glossPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [
+          whiteTint(isActive ? 0.16 : 0.05),
+          Colors.transparent,
+        ],
+        stops: const [0.0, 0.55],
+      ).createShader(rect);
+    canvas.drawPath(path, glossPaint);
 
-    final rivetPaint = Paint()..color = isActive ? const Color(0xFF8C7038) : const Color(0xFF332F2B);
+    // Внутренняя проточка
+    final grooveR = innerR - 9;
+    canvas.drawCircle(
+      center,
+      grooveR,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2
+        ..color = const Color(0xFF1A1713),
+    );
+
+    // Ступица
+    final hubR = innerR - 17;
+    canvas.drawCircle(
+      center,
+      hubR,
+      Paint()
+        ..shader = const RadialGradient(
+          center: Alignment(-0.35, -0.4),
+          radius: 1.0,
+          colors: [Color(0xFF221F1C), Color(0xFF121110), Color(0xFF0B0A09)],
+          stops: [0.0, 0.65, 1.0],
+        ).createShader(Rect.fromCircle(center: center, radius: hubR)),
+    );
+    canvas.drawCircle(
+      center,
+      hubR,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6
+        ..color = isActive ? const Color(0xFF6E5626) : const Color(0xFF2C2723),
+    );
+
+    // Заклепки
+    final rivetBase = Paint()..color = isActive ? const Color(0xFF7A5F2A) : const Color(0xFF2E2A26);
+    final rivetHighlight = Paint()..color = isActive ? const Color(0xFFE2C485) : const Color(0xFF4A443E);
     for (int i = 0; i < teeth; i++) {
       final a = (i * 2 * math.pi) / teeth + (math.pi / teeth);
       final rx = center.dx + (innerR - 8) * math.cos(a);
       final ry = center.dy + (innerR - 8) * math.sin(a);
-      canvas.drawCircle(Offset(rx, ry), 2.0, rivetPaint);
+      canvas.drawCircle(Offset(rx, ry), 3.0, rivetBase);
+      canvas.drawCircle(Offset(rx - 0.8, ry - 0.8), 1.3, rivetHighlight);
     }
   }
 
