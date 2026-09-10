@@ -160,21 +160,36 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   static const int _deadKeyTtlMs = 6 * 60 * 60 * 1000; // 6 часов
   static const int _deadKeyLimit = 900;
 
-  // РОТАЦИЯ: смещение по пулу источников, сохраняется между запусками
-  int _rotationOffset = 0;
+  // РОТАЦИЯ И ПРИОРИТЕТЫ
+  int _priorityOffset = 0;
+  int _generalOffset = 0;
   static const int _batchSize = 18;
   static const int _maxAutoRetries = 3;
 
   final math.Random _random = math.Random();
 
-  // РАСШИРЕННАЯ БАЗА ОТКРЫТЫХ ЗЕРКАЛ (VLESS Reality / Shadowsocks)
-  final List<String> gitHubSources = [
+  // 1. ПРИОРИТЕТНЫЕ РЕПОЗИТОРИИ ДЛЯ РФ (igareck & topics/free-vpn-russia)
+  // Протестированы на обход ТСПУ, белые списки и Reality
+  final List<String> priorityRussiaSources = [
+    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
+    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS.txt',
+    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/Vless-Reality-White-Lists-Rus-Mobile.txt',
+    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_SS+All_RUS.txt',
+    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt',
+    'https://cdn.jsdelivr.net/gh/AvenCores/goida-vpn-configs@main/vless.txt',
+    'https://cdn.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/clean/vless.txt',
+    'https://cdn.jsdelivr.net/gh/kort0881/vpn-vless-configs-russia@main/githubmirror/ru-sni/vless_ru.txt',
+    'https://cdn.jsdelivr.net/gh/hiztin/VLESS-PO-GRIBI@main/vless.txt',
+    'https://cdn.jsdelivr.net/gh/FLAT447/v2ray-lists@main/vless.txt',
+  ];
+
+  // 2. РЕЗЕРВНЫЕ МЕЖДУНАРОДНЫЕ ЗЕРКАЛА (VLESS Reality / Shadowsocks)
+  final List<String> generalSources = [
     'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/vless.txt',
     'https://cdn.jsdelivr.net/gh/barry-far/V2ray-config@main/Splitted-By-Protocol/ss.txt',
     'https://cdn.jsdelivr.net/gh/ebrasha/free-v2ray-public-list@main/vless_configs.txt',
     'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/vless.txt',
     'https://cdn.jsdelivr.net/gh/Delta-Kronecker/V2ray-Config@main/config/protocols/shadowsocks.txt',
-    'https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt',
     'https://cdn.jsdelivr.net/gh/mahdibland/V2RayAggregator@master/sub/sub_merge.txt',
     'https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/vless.txt',
     'https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/ss.txt',
@@ -182,6 +197,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     'https://cdn.jsdelivr.net/gh/soroushmirzaei/telegram-configs-collector@main/protocols/shadowsocks',
     'https://cdn.jsdelivr.net/gh/MhdiTaheri/V2rayCollector@main/sub/vless',
   ];
+
+  List<String> get gitHubSources => [...priorityRussiaSources, ...generalSources];
 
   @override
   void initState() {
@@ -227,7 +244,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
       final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
       pinnedConfigs = pinnedList.toSet();
 
-      _rotationOffset = prefs.getInt('rotation_offset') ?? 0;
+      _priorityOffset = prefs.getInt('priority_rotation_offset') ?? 0;
+      _generalOffset = prefs.getInt('general_rotation_offset') ?? 0;
 
       final dead = prefs.getStringList('dead_endpoints') ?? [];
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -278,7 +296,9 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
   Future<void> _saveRotationOffset() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt('rotation_offset', _rotationOffset);
+      await prefs.setInt('priority_rotation_offset', _priorityOffset);
+      await prefs.setInt('general_rotation_offset', _generalOffset);
+      await prefs.setInt('rotation_offset', _priorityOffset);
     } catch (_) {}
   }
 
@@ -330,7 +350,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     _deadKeys.remove(_blacklistKey(rawConfig));
   }
 
-  // КОНФИГУРАЦИЯ ЯДРА (DNS и сниффинг не менять)
+  // КОНФИГУРАЦИЯ ЯДРА (DNS и сниффинг по эталону v2rayNG)
 
   String _buildCleanConfig(String rawConfig) {
     final v2rayURL = FlutterV2ray.parseFromURL(rawConfig);
@@ -484,13 +504,13 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     return results;
   }
 
-  // СБОР УЗЛОВ: ротация, перемешивание, отсечение черного списка
+  // СБОР УЗЛОВ: ПРЕОБЛАДАЮЩИЙ ОПРОС igareck И topics/free-vpn-russia С РЕЗЕРВОМ
 
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
     setState(() => isSearchingGitHub = true);
 
-    _showToast("Синхронизация узлов: опрос реестров GitHub", isSuccess: true);
+    _showToast("Синхронизация узлов: опрос реестров РФ и зеркал", isSuccess: true);
 
     try {
       await _runDiscoveryCycle(attempt: 0);
@@ -503,18 +523,22 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     }
   }
 
-  Future<List<String>> _fetchPool() async {
-    // Ротация источников: каждый цикл стартует с другого зеркала
-    final ordered = <String>[];
-    final total = gitHubSources.length;
-    for (int i = 0; i < total; i++) {
-      ordered.add(gitHubSources[(_rotationOffset + i) % total]);
+  Future<Map<String, List<String>>> _fetchPool() async {
+    // 1. Формируем пачку приоритетных источников (РФ / igareck / topics/free-vpn-russia)
+    final priorityBatch = <String>[];
+    final pTotal = priorityRussiaSources.length;
+    for (int i = 0; i < 4; i++) {
+      priorityBatch.add(priorityRussiaSources[(_priorityOffset + i) % pTotal]);
     }
 
-    // Опрашиваем первую половину списка параллельно, чтобы не ждать мертвые зеркала
-    final batch = ordered.take(6).toList();
+    // 2. Формируем пачку общих международных зеркал для разнообразия и отказоустойчивости
+    final generalBatch = <String>[];
+    final gTotal = generalSources.length;
+    for (int i = 0; i < 3; i++) {
+      generalBatch.add(generalSources[(_generalOffset + i) % gTotal]);
+    }
 
-    final results = await Future.wait(batch.map((url) async {
+    final priorityFutures = priorityBatch.map((url) async {
       try {
         final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
         if (res.statusCode == 200 && res.body.isNotEmpty) {
@@ -522,24 +546,54 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
         }
       } catch (_) {}
       return <String>[];
-    }));
+    });
 
-    final pool = <String>[];
-    final seen = <String>{};
-    for (final list in results) {
-      for (final config in list) {
-        if (seen.add(config)) pool.add(config);
+    final generalFutures = generalBatch.map((url) async {
+      try {
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
+        if (res.statusCode == 200 && res.body.isNotEmpty) {
+          return _extractConfigs(res.body);
+        }
+      } catch (_) {}
+      return <String>[];
+    });
+
+    final priorityResults = await Future.wait(priorityFutures);
+    final generalResults = await Future.wait(generalFutures);
+
+    final priorityPool = <String>[];
+    final seenPriority = <String>{};
+    for (final list in priorityResults) {
+      for (final cfg in list) {
+        if (seenPriority.add(cfg)) priorityPool.add(cfg);
       }
     }
-    return pool;
+
+    final generalPool = <String>[];
+    final seenGeneral = <String>{};
+    for (final list in generalResults) {
+      for (final cfg in list) {
+        if (!seenPriority.contains(cfg) && seenGeneral.add(cfg)) {
+          generalPool.add(cfg);
+        }
+      }
+    }
+
+    return {
+      'priority': priorityPool,
+      'general': generalPool,
+    };
   }
 
   Future<void> _runDiscoveryCycle({required int attempt}) async {
-    final pool = await _fetchPool();
+    final pools = await _fetchPool();
+    final priorityList = pools['priority'] ?? [];
+    final generalList = pools['general'] ?? [];
 
-    if (pool.isEmpty) {
+    if (priorityList.isEmpty && generalList.isEmpty) {
       if (attempt < _maxAutoRetries) {
-        _rotationOffset = (_rotationOffset + 3) % gitHubSources.length;
+        _priorityOffset = (_priorityOffset + 3) % priorityRussiaSources.length;
+        _generalOffset = (_generalOffset + 3) % generalSources.length;
         if (mounted) _showToast("Поиск альтернативных узлов...", isSuccess: true);
         await Future.delayed(const Duration(milliseconds: 400));
         return _runDiscoveryCycle(attempt: attempt + 1);
@@ -548,17 +602,42 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
       return;
     }
 
-    // Отсекаем заведомо мертвые ключи до любых замеров
-    final filtered = pool.where((c) => !_isBlacklisted(c)).toList();
-    final workingPool = filtered.isNotEmpty ? filtered : pool;
+    // Отсекаем черный список
+    final cleanPriority = priorityList.where((c) => !_isBlacklisted(c)).toList();
+    final cleanGeneral = generalList.where((c) => !_isBlacklisted(c)).toList();
+
+    final workingPriority = cleanPriority.isNotEmpty ? cleanPriority : priorityList;
+    final workingGeneral = cleanGeneral.isNotEmpty ? cleanGeneral : generalList;
 
     // Перемешивание: каждый поиск выдает свежую выборку, а не первые строки файла
-    workingPool.shuffle(_random);
+    workingPriority.shuffle(_random);
+    workingGeneral.shuffle(_random);
 
     final collectedNodes = <ServerNode>[];
     collectedNodes.addAll(autoServers.where((s) => s.isPinned));
 
-    for (final config in workingPool) {
+    // Преобладающая квота для качественных РФ реестров (70% выборки: ~13 узлов)
+    const int priorityQuota = 13;
+    final priorityPick = workingPriority.take(priorityQuota).toList();
+
+    // Дополняем резервными зеркалами до размера пакета _batchSize (18 узлов)
+    final remainingCount = _batchSize - collectedNodes.length - priorityPick.length;
+    final generalPick = workingGeneral.take(math.max(0, remainingCount)).toList();
+
+    // Балансировка: если одного пула не хватило, добираем из второго
+    final combinedConfigs = <String>[...priorityPick, ...generalPick];
+    if (combinedConfigs.length < (_batchSize - collectedNodes.length)) {
+      for (final c in workingPriority) {
+        if (combinedConfigs.length >= (_batchSize - collectedNodes.length)) break;
+        if (!combinedConfigs.contains(c)) combinedConfigs.add(c);
+      }
+      for (final c in workingGeneral) {
+        if (combinedConfigs.length >= (_batchSize - collectedNodes.length)) break;
+        if (!combinedConfigs.contains(c)) combinedConfigs.add(c);
+      }
+    }
+
+    for (final config in combinedConfigs) {
       if (collectedNodes.length >= _batchSize) break;
       if (collectedNodes.any((n) => n.rawConfig == config)) continue;
 
@@ -606,9 +685,10 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
       if (selectedIndex >= autoServers.length) selectedIndex = 0;
     });
 
-    // ЗАЩИТНЫЙ АЛГОРИТМ: пустой список запускает следующее смещение источников
+    // ЗАЩИТНЫЙ АЛГОРИТМ: пустой список автоматически запускает поиск по следующим смещениям
     if (autoServers.isEmpty && attempt < _maxAutoRetries) {
-      _rotationOffset = (_rotationOffset + 2) % gitHubSources.length;
+      _priorityOffset = (_priorityOffset + 2) % priorityRussiaSources.length;
+      _generalOffset = (_generalOffset + 2) % generalSources.length;
       _showToast("Поиск альтернативных узлов...", isSuccess: true);
       await Future.delayed(const Duration(milliseconds: 300));
       return _runDiscoveryCycle(attempt: attempt + 1);
@@ -617,7 +697,8 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     if (autoServers.isEmpty) {
       _showToast("Стабильных узлов не найдено. Повторите синхронизацию", isSuccess: false);
     } else {
-      _rotationOffset = (_rotationOffset + 1) % gitHubSources.length;
+      _priorityOffset = (_priorityOffset + 2) % priorityRussiaSources.length;
+      _generalOffset = (_generalOffset + 1) % generalSources.length;
       _showToast("Проверка завершена. Активных узлов: ${autoServers.length}", isSuccess: true);
     }
   }
@@ -705,9 +786,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
 
       try {
         await flutterV2ray.stopV2Ray();
-        // Пауза на освобождение системного сокета Android VpnService
         await Future.delayed(const Duration(milliseconds: 180));
-        // Снимаем флаг до старта, иначе событие CONNECTED будет отброшено
         if (mounted) setState(() => _isReconnecting = false);
         await _startTunnel(targetNode);
       } catch (_) {
@@ -1010,7 +1089,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
               const SizedBox(height: 8),
               const Text(
                 "1. Сбор реестров GitHub:\n"
-                "Параллельный опрос открытых баз VLESS Reality и Shadowsocks с ротацией зеркал и случайной выборкой узлов.\n\n"
+                "Преобладающий опрос проверенных российских реестров (igareck & topics/free-vpn-russia) с автоматической ротацией и резервными зеркалами.\n\n"
                 "2. Черный список:\n"
                 "Эндпоинты с подтвержденным таймаутом отсекаются до замера и хранятся 6 часов.\n\n"
                 "3. Честный замер Real Delay:\n"
@@ -1021,7 +1100,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
               ),
               const SizedBox(height: 10),
               Text(
-                "Записей в черном списке: ${_deadKeys.length}\nТекущее смещение реестров: $_rotationOffset",
+                "Записей в черном списке: ${_deadKeys.length}\nПриоритет (РФ): смещение $_priorityOffset\nРезерв: смещение $_generalOffset",
                 style: const TextStyle(color: Palette.textMuted, fontSize: 11.5, height: 1.4),
               ),
             ],
@@ -1095,7 +1174,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with TickerProviderStateM
     );
   }
 
-  // АНАЛОГОВО-ЦИФРОВОЙ ДАТЧИК ЗАДЕРЖКИ
   Widget _buildGauge(ServerNode? node) {
     final ping = node?.ping ?? -1;
     final hasNode = node != null;
