@@ -153,7 +153,6 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
   // Черный список мертвых эндпоинтов: "host:port" -> timestamp(ms)
   Map<String, int> deadKeysMap = {};
-  int _mirrorRotationOffset = 0;
 
   static const int _deadKeyTtlMs = 48 * 60 * 60 * 1000; // 48 часов
   static const int _deadKeysMaxSize = 500;
@@ -165,16 +164,24 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   static const int _minCollectedNodes = 10;
   static const int _maxCollectedNodes = 15;
 
-  // Единственный разрешенный источник ключей: реестр igareck/vpn-configs-for-russia.
-  // Файлы содержат сотни строк, поэтому из каждого запроса берется лишь
-  // случайная выборка на _minCollectedNodes.._maxCollectedNodes узлов.
-  final List<String> gitHubSources = [
-    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt',
-    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt',
-    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS%2BAll_RUS.txt',
-    'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt',
-    'https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt',
-  ];
+  // Источник ключей не фиксирован жестко: список репозиториев запрашивается
+  // через официальный GitHub Search API по теме free-vpn-key
+  // (та же выборка, что отображается на github.com/topics/free-vpn-key),
+  // отсортированной по дате последнего обновления репозитория. HTML-страница
+  // топика не парсится напрямую: она подвержена изменениям верстки и требует
+  // JS-рендеринга, тогда как Search API отдает тот же список в стабильном
+  // JSON-формате.
+  static const String _topicSearchUrl =
+      'https://api.github.com/search/repositories?q=topic:free-vpn-key&sort=updated&order=desc&per_page=25';
+
+  // Кэш обнаруженных репозиториев, чтобы не упираться в лимит Search API
+  // (10 запросов/мин без авторизации). Список репозиториев обновляется не
+  // чаще раза в час, а вот содержимое README запрашивается заново при
+  // каждом поиске — именно это дает свежие ключи, так как большинство
+  // репозиториев темы автообновляют списки каждые 5-15 минут.
+  List<Map<String, String>> _discoveredRepos = [];
+  int _reposDiscoveredAt = 0;
+  static const int _repoCacheTtlMs = 60 * 60 * 1000;
 
   @override
   void initState() {
@@ -207,7 +214,18 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
       final pinnedList = prefs.getStringList('pinned_vpn_configs') ?? [];
       pinnedConfigs = pinnedList.toSet();
 
-      _mirrorRotationOffset = prefs.getInt('mirror_rotation_offset') ?? 0;
+      final repoList = prefs.getStringList('discovered_vpn_repos') ?? [];
+      _reposDiscoveredAt = prefs.getInt('discovered_vpn_repos_ts') ?? 0;
+      _discoveredRepos = repoList
+          .map((s) {
+            final parts = s.split('|');
+            return {
+              'repo': parts.isNotEmpty ? parts[0] : '',
+              'branch': parts.length > 1 ? parts[1] : 'main',
+            };
+          })
+          .where((m) => (m['repo'] ?? '').isNotEmpty)
+          .toList();
 
       final deadRaw = prefs.getStringList('dead_keys_blacklist') ?? [];
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -301,20 +319,112 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     } catch (_) {}
   }
 
-  Future<void> _advanceRotationOffset() async {
-    if (gitHubSources.isEmpty) return;
-    _mirrorRotationOffset = (_mirrorRotationOffset + 1) % gitHubSources.length;
+  // ------------------------------------------------------------------
+  // ОБНАРУЖЕНИЕ РЕПОЗИТОРИЕВ ПО ТЕМЕ free-vpn-key
+  // ------------------------------------------------------------------
+
+  Future<void> _ensureDiscoveredRepos({bool forceRefresh = false}) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!forceRefresh && _discoveredRepos.isNotEmpty && now - _reposDiscoveredAt < _repoCacheTtlMs) {
+      return;
+    }
+
+    try {
+      final res = await http.get(
+        Uri.parse(_topicSearchUrl),
+        headers: const {
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'ScaleVPN-Android-Client',
+        },
+      ).timeout(const Duration(seconds: 6));
+
+      if (res.statusCode == 200) {
+        final Map<String, dynamic> data = jsonDecode(res.body);
+        final items = (data['items'] as List<dynamic>?) ?? [];
+        final List<Map<String, String>> fresh = [];
+        for (final item in items) {
+          final fullName = item['full_name'] as String?;
+          final branch = (item['default_branch'] as String?) ?? 'main';
+          if (fullName != null && fullName.isNotEmpty) {
+            fresh.add({'repo': fullName, 'branch': branch});
+          }
+        }
+        if (fresh.isNotEmpty) {
+          _discoveredRepos = fresh;
+          _reposDiscoveredAt = now;
+          await _saveDiscoveredRepos();
+        }
+      }
+    } catch (_) {
+      // Сеть недоступна или лимит Search API исчерпан — используем
+      // предыдущий кэшированный список репозиториев, если он есть.
+    }
+  }
+
+  Future<void> _saveDiscoveredRepos() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt('mirror_rotation_offset', _mirrorRotationOffset);
+      final list = _discoveredRepos.map((r) => "${r['repo']}|${r['branch']}").toList();
+      await prefs.setStringList('discovered_vpn_repos', list);
+      await prefs.setInt('discovered_vpn_repos_ts', _reposDiscoveredAt);
     } catch (_) {}
   }
 
-  List<String> _rotatedSourceList() {
-    final n = gitHubSources.length;
-    if (n == 0) return [];
-    final offset = _mirrorRotationOffset % n;
-    return [for (int i = 0; i < n; i++) gitHubSources[(offset + i) % n]];
+  // Каждый заход поиска перемешивает обнаруженные репозитории заново —
+  // README запрашивается напрямую, без привязки к фиксированному смещению.
+  List<String> _buildCandidateUrlsFromRepos() {
+    if (_discoveredRepos.isEmpty) return [];
+    final repos = List<Map<String, String>>.from(_discoveredRepos)..shuffle(math.Random());
+    return [
+      for (final repo in repos) 'https://raw.githubusercontent.com/${repo['repo']}/${repo['branch']}/README.md',
+    ];
+  }
+
+  // README репозиториев часто содержат не сами ключи, а ссылку на
+  // необработанный текстовый файл подписки — вытаскиваем такие ссылки,
+  // чтобы дойти до реальных vless:// и ss:// строк.
+  List<String> _extractSubscriptionLinks(String text) {
+    final matches = RegExp(r'https?://[^\s\)\]"<>]+', caseSensitive: false).allMatches(text);
+    final Set<String> links = {};
+    for (final m in matches) {
+      final url = m.group(0) ?? '';
+      final lower = url.toLowerCase();
+      final looksLikeRawHost = lower.contains('raw.githubusercontent.com') ||
+          lower.contains('cdn.jsdelivr.net') ||
+          lower.contains('raw.githack.com');
+      final looksLikeTextFile = lower.endsWith('.txt') || lower.contains('.txt?') || lower.contains('.txt#');
+      if (looksLikeRawHost && looksLikeTextFile) {
+        links.add(url);
+      }
+    }
+    return links.toList();
+  }
+
+  void _absorbConfigsFromText(String rawText, List<ServerNode> collectedNodes, int targetCount) {
+    final configs = _extractConfigs(rawText);
+    configs.shuffle(math.Random());
+    for (final config in configs) {
+      if (collectedNodes.length >= targetCount) break;
+      if (collectedNodes.any((n) => n.rawConfig == config)) continue;
+      if (_isKeyBlacklisted(config)) continue;
+
+      String title = "Узел ${collectedNodes.length + 1}";
+      if (config.contains('#')) {
+        try {
+          title = Uri.decodeComponent(config.split('#').last).trim();
+        } catch (_) {
+          title = config.split('#').last;
+        }
+      }
+
+      collectedNodes.add(ServerNode(
+        name: title.isEmpty ? "Узел ${collectedNodes.length + 1}" : title,
+        rawConfig: config,
+        ping: -2,
+        isPinned: pinnedConfigs.contains(config),
+      ));
+    }
   }
 
   // ------------------------------------------------------------------
@@ -473,26 +583,27 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
   }
 
   // ------------------------------------------------------------------
-  // ПОИСК КЛЮЧЕЙ НА GITHUB: РОТАЦИЯ, ЧЕРНЫЙ СПИСОК, АВТОПОВТОР
+  // ПОИСК КЛЮЧЕЙ: ОБНАРУЖЕНИЕ РЕПОЗИТОРИЕВ, ЧЕРНЫЙ СПИСОК, АВТОПОВТОР
   // ------------------------------------------------------------------
 
   Future<void> _searchGitHubForKeys() async {
     if (isSearchingGitHub) return;
     setState(() => isSearchingGitHub = true);
-    _showToast("Поиск ключей в открытых реестрах...", isSuccess: true);
+    _showToast("Поиск репозиториев по теме free-vpn-key...", isSuccess: true);
 
-    await _advanceRotationOffset();
     await _performSearchAttempt(0);
 
     if (mounted) setState(() => isSearchingGitHub = false);
   }
 
   Future<void> _performSearchAttempt(int attempt) async {
+    await _ensureDiscoveredRepos();
+
     List<ServerNode> collectedNodes = [];
     final existingPinned = autoServers.where((s) => s.isPinned).toList();
     collectedNodes.addAll(existingPinned);
 
-    final orderedSources = _rotatedSourceList();
+    final orderedUrls = _buildCandidateUrlsFromRepos();
     final random = math.Random();
     bool anyResponseOk = false;
 
@@ -500,48 +611,47 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
     final int targetCount = _minCollectedNodes +
         random.nextInt(_maxCollectedNodes - _minCollectedNodes + 1);
 
-    for (final url in orderedSources) {
+    int extraLinksFetched = 0;
+    const int maxExtraLinks = 6;
+
+    for (final url in orderedUrls) {
+      if (collectedNodes.length >= targetCount) break;
       try {
         final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
         if (res.statusCode == 200 && res.body.isNotEmpty) {
           anyResponseOk = true;
-          final configs = _extractConfigs(res.body);
-          configs.shuffle(random);
 
-          for (final config in configs) {
-            if (collectedNodes.any((n) => n.rawConfig == config)) continue;
-            if (_isKeyBlacklisted(config)) continue;
+          // Сам README может содержать прямые ключи.
+          _absorbConfigsFromText(res.body, collectedNodes, targetCount);
 
-            String title = "Узел ${collectedNodes.length + 1}";
-            if (config.contains('#')) {
+          // Либо ссылку на отдельный текстовый файл подписки — идем по ней.
+          if (collectedNodes.length < targetCount && extraLinksFetched < maxExtraLinks) {
+            final subLinks = _extractSubscriptionLinks(res.body);
+            for (final link in subLinks) {
+              if (extraLinksFetched >= maxExtraLinks) break;
+              if (collectedNodes.length >= targetCount) break;
+              extraLinksFetched++;
               try {
-                title = Uri.decodeComponent(config.split('#').last).trim();
-              } catch (_) {
-                title = config.split('#').last;
-              }
+                final subRes = await http.get(Uri.parse(link)).timeout(const Duration(seconds: 4));
+                if (subRes.statusCode == 200 && subRes.body.isNotEmpty) {
+                  anyResponseOk = true;
+                  _absorbConfigsFromText(subRes.body, collectedNodes, targetCount);
+                }
+              } catch (_) {}
             }
-
-            collectedNodes.add(ServerNode(
-              name: title.isEmpty ? "Узел ${collectedNodes.length + 1}" : title,
-              rawConfig: config,
-              ping: -2,
-              isPinned: pinnedConfigs.contains(config),
-            ));
-            if (collectedNodes.length >= targetCount) break;
           }
         }
       } catch (_) {
         continue;
       }
-      if (collectedNodes.length >= targetCount) break;
     }
 
     final bool gotFreshNodes = collectedNodes.length > existingPinned.length;
 
     if (!anyResponseOk) {
-      if (mounted) _showToast("Ошибка связи с реестрами GitHub", isSuccess: false);
+      if (mounted) _showToast("Не удалось связаться с репозиториями GitHub", isSuccess: false);
       if (attempt < _maxAutoRetries) {
-        await _advanceRotationOffset();
+        if (attempt >= 1) await _ensureDiscoveredRepos(forceRefresh: true);
         await _performSearchAttempt(attempt + 1);
       }
       return;
@@ -549,7 +659,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
     if (!gotFreshNodes && existingPinned.isEmpty) {
       if (attempt < _maxAutoRetries) {
-        await _advanceRotationOffset();
+        if (attempt >= 1) await _ensureDiscoveredRepos(forceRefresh: true);
         if (mounted) _showToast("Поиск альтернативных узлов...", isSuccess: true);
         await _performSearchAttempt(attempt + 1);
       } else if (mounted) {
@@ -583,7 +693,7 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
 
     if (autoServers.isEmpty) {
       if (attempt < _maxAutoRetries) {
-        await _advanceRotationOffset();
+        if (attempt >= 1) await _ensureDiscoveredRepos(forceRefresh: true);
         if (mounted) _showToast("Поиск альтернативных узлов...", isSuccess: true);
         await _performSearchAttempt(attempt + 1);
       } else if (mounted) {
@@ -931,9 +1041,11 @@ class _MainVpnScreenState extends State<MainVpnScreen> with SingleTickerProvider
               ),
               SizedBox(height: 8),
               Text(
-                "1. Сбор реестров GitHub:\n"
-                "Ротация стартового зеркала при каждом поиске и случайное перемешивание "
-                "полученных ключей, чтобы не застревать на мертвых записях в начале списка.\n\n"
+                "1. Обнаружение источников:\n"
+                "Запрос GitHub Search API по теме free-vpn-key (github.com/topics/free-vpn-key), "
+                "сортировка по дате последнего обновления репозитория. Список репозиториев "
+                "кэшируется на час, а README каждого запрашивается заново при каждом поиске "
+                "и перемешивается — вставляется случайная выборка из 10-15 узлов.\n\n"
                 "2. Черный список мертвых узлов:\n"
                 "Гарантированно нерабочие эндпоинты отсекаются еще до замера задержки "
                 "и хранятся ограниченное время.\n\n"
